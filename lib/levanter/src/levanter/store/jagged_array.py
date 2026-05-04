@@ -220,7 +220,8 @@ class JaggedArrayStore:
     async def data_size_async(self):
         if self._cached_data_size is not None:
             return self._cached_data_size
-        result = int(await self.offsets[self.num_rows].read())
+        num_rows = await self.num_rows_async()
+        result = int(await self.offsets[num_rows].read())
         if self._cache_metadata:
             self._cached_data_size = result
         return result
@@ -235,11 +236,11 @@ class JaggedArrayStore:
         """
         Trims so we have exactly `size` rows in the jagged array.
         """
-        if size >= len(self):
+        current_num_rows = await self.num_rows_async()
+        if size >= current_num_rows:
             return
 
-        current_data_size = self.data_size
-        current_num_rows = await self.num_rows_async()
+        current_data_size = await self.data_size_async()
 
         offsets_fut = self.offsets[size + 1 : current_num_rows + 1].write(0)
 
@@ -313,7 +314,7 @@ class JaggedArrayStore:
 
         num_rows = await self.num_rows_async()
         num_added = len(new_offsets)
-        current_data_size = self.data_size
+        current_data_size = await self.data_size_async()
 
         new_offsets = new_offsets + current_data_size
 
@@ -415,7 +416,7 @@ class JaggedArrayStore:
                 data = await self.data[start:stop].read()
 
                 if self.shapes is not None:
-                    shapes = np.array(self.shapes[item])
+                    shapes = await self.shapes[item].read()
                     data = data.reshape(*shapes, -1)
                 return data
             except ValueError as e:

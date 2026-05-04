@@ -77,7 +77,7 @@ class TokenSeqDataset(AsyncDataset[np.ndarray]):
 
     async def async_len(self) -> int:
         token_arrays = await self._await_token_cache()
-        return token_arrays.data_size // self.seq_len
+        return await token_arrays.data_size_async() // self.seq_len
 
     async def _await_token_cache(self) -> JaggedArrayStore:
         if self._store is None:

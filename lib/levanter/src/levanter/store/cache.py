@@ -110,7 +110,7 @@ class TreeCache(AsyncDataset[T_co]):
         return self._store
 
     async def async_len(self) -> int:
-        return len(self.store)
+        return await self.store.async_len()
 
     def __len__(self):
         return len(self.store)
@@ -123,7 +123,8 @@ class TreeCache(AsyncDataset[T_co]):
 
     async def get_batch(self, indices: Sequence[int] | slice):
         if isinstance(indices, slice):
-            indices = range(indices.start or 0, indices.stop or len(self), indices.step or 1)
+            stop = indices.stop if indices.stop is not None else await self.async_len()
+            indices = range(indices.start or 0, stop, indices.step or 1)
         return await self.store.get_batch(indices)
 
     def get_batch_sync(self, indices_or_slice, *, timeout: Optional[float] = None):
