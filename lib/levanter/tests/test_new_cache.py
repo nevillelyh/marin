@@ -420,6 +420,41 @@ def test_sharded_tree_cache_opens_shards_lazily(monkeypatch):
     assert opened_paths == [os.path.join(shard_paths[0], "data")]
 
 
+def test_sharded_tree_cache_treats_scalar_lists_as_leaves(monkeypatch):
+    shard_paths = ["/tmp/shard_0"]
+    ledger = CacheLedger(
+        total_num_rows=1,
+        shard_rows={os.path.basename(shard_paths[0]): 1},
+        is_finished=True,
+        finished_shards=[os.path.basename(shard_paths[0])],
+        field_counts={},
+        metadata=CacheMetadata.empty(),
+        shard_paths=shard_paths,
+    )
+    opened_paths = []
+
+    class FakeJaggedArrayStore:
+        data_size = 1024
+
+        async def data_size_async(self):
+            return self.data_size
+
+    def open_store(path, *, mode, item_rank, dtype, cache_metadata):
+        assert item_rank == 1
+        assert dtype == np.dtype(np.int64)
+        opened_paths.append(path)
+        return FakeJaggedArrayStore()
+
+    monkeypatch.setattr(cache_module.JaggedArrayStore, "open", open_store)
+
+    cache = ShardedTreeCache(shard_paths, {"input_ids": [0]}, ledger)
+
+    token_arrays = cache.store.tree["input_ids"]
+    assert token_arrays.num_rows == 1
+    assert token_arrays.data_size == 1024
+    assert opened_paths == [os.path.join(shard_paths[0], "input_ids")]
+
+
 @pytest.mark.asyncio
 async def test_sharded_array_reads_slice_shards_concurrently():
     started = 0

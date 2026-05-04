@@ -38,7 +38,7 @@ from ..data.sharded_datasource import ShardedDataSource
 from ..utils.fsspec_utils import exists as fsspec_exists
 from ..utils.fsspec_utils import remove as fsspec_remove
 from .jagged_array import JaggedArrayStore, _no_cache_read_context
-from .tree_store import TreeStore, _render_path_elem
+from .tree_store import TreeStore, _render_path_elem, heuristic_is_leaf
 
 T = TypeVar("T")
 U = TypeVar("U")
@@ -433,7 +433,7 @@ class ShardedTreeStore:
         self.mode = "r"
         self._shard_paths = list(shard_paths)
         self._shard_rows = list(shard_rows)
-        self.tree = jtu.tree_map_with_path(self._open_lazy_leaf, exemplar)
+        self.tree = jtu.tree_map_with_path(self._open_lazy_leaf, exemplar, is_leaf=heuristic_is_leaf)
 
     def _open_lazy_leaf(self, tree_path, item):
         item = np.asarray(item)
