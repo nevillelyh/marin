@@ -4,7 +4,6 @@
 import asyncio
 import os
 import tempfile
-import threading
 from typing import Any, Dict, Iterator, Sequence
 
 import numpy as np
@@ -381,7 +380,7 @@ def test_sharded_tree_cache_reads_across_shards():
             np.testing.assert_array_equal(b["data"], all_expected[idx]["data"])
 
 
-def test_sharded_tree_cache_opens_shards_concurrently(monkeypatch):
+def test_sharded_tree_cache_opens_shards_lazily(monkeypatch):
     shard_paths = [f"/tmp/shard_{idx}" for idx in range(3)]
     ledger = CacheLedger(
         total_num_rows=len(shard_paths),
@@ -392,36 +391,33 @@ def test_sharded_tree_cache_opens_shards_concurrently(monkeypatch):
         metadata=CacheMetadata.empty(),
         shard_paths=shard_paths,
     )
-    first_open_started = threading.Event()
-    second_open_started = threading.Event()
-    release_first_open = threading.Event()
+    opened_paths = []
 
-    class FakeShardedTreeStore:
-        def __init__(self, stores):
-            self.stores = stores
+    class FakeJaggedArrayStore:
+        def __init__(self, path):
+            self.path = path
 
-    def open_store(exemplar, path, *, mode, cache_metadata):
-        assert exemplar == {}
+        def __getitem__(self, item):
+            return np.asarray([item])
+
+    def open_store(path, *, mode, item_rank, dtype, cache_metadata):
         assert mode == "r"
+        assert item_rank == 1
+        assert dtype == np.dtype(np.int64)
         assert cache_metadata is False
+        opened_paths.append(path)
+        return FakeJaggedArrayStore(path)
 
-        if path == shard_paths[0]:
-            first_open_started.set()
-            assert second_open_started.wait(timeout=2)
-            release_first_open.set()
-        elif path == shard_paths[1]:
-            assert first_open_started.wait(timeout=2)
-            second_open_started.set()
-            assert release_first_open.wait(timeout=2)
+    monkeypatch.setattr(cache_module.JaggedArrayStore, "open", open_store)
 
-        return path
+    cache = ShardedTreeCache(shard_paths, {"data": np.asarray([0], dtype=np.int64)}, ledger)
 
-    monkeypatch.setattr(cache_module.TreeStore, "open", open_store)
-    monkeypatch.setattr(cache_module, "ShardedTreeStore", FakeShardedTreeStore)
+    assert opened_paths == []
+    assert cache.store.tree["data"].num_rows == len(shard_paths)
+    assert opened_paths == []
 
-    cache = ShardedTreeCache(shard_paths, {}, ledger)
-
-    assert cache.store.stores == shard_paths
+    np.testing.assert_array_equal(cache[0]["data"], np.asarray([0]))
+    assert opened_paths == [os.path.join(shard_paths[0], "data")]
 
 
 @pytest.mark.asyncio
