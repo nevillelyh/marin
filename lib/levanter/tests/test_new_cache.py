@@ -4,12 +4,14 @@
 import asyncio
 import os
 import tempfile
+import threading
 from typing import Any, Dict, Iterator, Sequence
 
 import numpy as np
 import pytest
 from zephyr.execution import ZephyrWorkerError
 
+import levanter.store.cache as cache_module
 from levanter.data import BatchProcessor, ShardedDataSource, batched
 from levanter.data.packing import GreedyPrepackedDataset
 from levanter.data.sharded_datasource import TextUrlDataSource
@@ -377,6 +379,49 @@ def test_sharded_tree_cache_reads_across_shards():
         batch = cache.get_batch_sync(cross_indices)
         for idx, b in zip(cross_indices, batch):
             np.testing.assert_array_equal(b["data"], all_expected[idx]["data"])
+
+
+def test_sharded_tree_cache_opens_shards_concurrently(monkeypatch):
+    shard_paths = [f"/tmp/shard_{idx}" for idx in range(3)]
+    ledger = CacheLedger(
+        total_num_rows=len(shard_paths),
+        shard_rows={os.path.basename(path): 1 for path in shard_paths},
+        is_finished=True,
+        finished_shards=[os.path.basename(path) for path in shard_paths],
+        field_counts={},
+        metadata=CacheMetadata.empty(),
+        shard_paths=shard_paths,
+    )
+    first_open_started = threading.Event()
+    second_open_started = threading.Event()
+    release_first_open = threading.Event()
+
+    class FakeShardedTreeStore:
+        def __init__(self, stores):
+            self.stores = stores
+
+    def open_store(exemplar, path, *, mode, cache_metadata):
+        assert exemplar == {}
+        assert mode == "r"
+        assert cache_metadata is False
+
+        if path == shard_paths[0]:
+            first_open_started.set()
+            assert second_open_started.wait(timeout=2)
+            release_first_open.set()
+        elif path == shard_paths[1]:
+            assert first_open_started.wait(timeout=2)
+            second_open_started.set()
+            assert release_first_open.wait(timeout=2)
+
+        return path
+
+    monkeypatch.setattr(cache_module.TreeStore, "open", open_store)
+    monkeypatch.setattr(cache_module, "ShardedTreeStore", FakeShardedTreeStore)
+
+    cache = ShardedTreeCache(shard_paths, {}, ledger)
+
+    assert cache.store.stores == shard_paths
 
 
 @pytest.mark.asyncio

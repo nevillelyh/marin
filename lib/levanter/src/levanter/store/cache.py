@@ -3,6 +3,7 @@
 
 import asyncio
 import bisect
+import concurrent.futures
 import copy
 import dataclasses
 import gc
@@ -46,7 +47,7 @@ T_co = TypeVar("T_co", covariant=True)
 logger = pylogging.getLogger(__name__)
 
 LEDGER_FILE_NAME = "shard_ledger.json"
-CONSOLIDATE_DATA_SIZE_WORKERS = 32
+CACHE_WORKERS = 32
 
 DEFAULT_LOG_LEVEL = pylogging.INFO
 LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
@@ -398,18 +399,29 @@ class ShardedTreeCache(AsyncDataset[T_co]):
         self._shard_paths = shard_paths
 
         # Build cumulative row boundaries: [0, rows_shard0, rows_shard0+rows_shard1, ...]
-        self._cum_rows: list[int] = [0]
-        self._stores: list[TreeStore] = []
-        for path in shard_paths:
-            shard_name = os.path.basename(path)
-            rows = ledger.shard_rows.get(shard_name, 0)
-            self._cum_rows.append(self._cum_rows[-1] + rows)
-            self._stores.append(TreeStore.open(exemplar, path, mode="r", cache_metadata=False))
+        self._cum_rows = _cumulative_offsets(
+            [ledger.shard_rows.get(os.path.basename(path), 0) for path in shard_paths]
+        )
+        self._stores = self._open_stores(exemplar, shard_paths)
         self._store = ShardedTreeStore(self._stores)
 
     @property
     def store(self) -> ShardedTreeStore:
         return self._store
+
+    def _open_stores(self, exemplar: Any, shard_paths: Sequence[str]) -> list[TreeStore]:
+        if not shard_paths:
+            return []
+
+        max_workers = min(len(shard_paths), CACHE_WORKERS)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="sharded_tree_cache_open",
+        ) as executor:
+            futures = [
+                executor.submit(TreeStore.open, exemplar, path, mode="r", cache_metadata=False) for path in shard_paths
+            ]
+            return [future.result() for future in futures]
 
     def _resolve_index(self, global_idx: int) -> tuple[int, int]:
         """Return (shard_index, local_row) for a global row index."""
@@ -818,7 +830,7 @@ def consolidate_shard_caches(
 
     probe_ctx = ZephyrContext(
         resources=ResourceConfig(ram="5g", cpu=2),
-        max_workers=min(CONSOLIDATE_DATA_SIZE_WORKERS, len(shard_cache_paths)),
+        max_workers=min(CACHE_WORKERS, len(shard_cache_paths)),
         name="levanter-cache-probe",
     )
     probe_results = probe_ctx.execute(
