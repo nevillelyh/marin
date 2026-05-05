@@ -74,7 +74,8 @@ def test_relative_shard_path_keeps_external_local_paths_absolute():
         assert _relative_shard_path(output_path, external_shard) == external_shard
 
 
-def test_consolidate_external_shards_uses_absolute_paths():
+@pytest.mark.asyncio
+async def test_consolidate_external_shards_uses_absolute_paths():
     with tempfile.TemporaryDirectory(prefix="levanter-test-external-shards-") as tmpdir:
         source_dir = os.path.join(tmpdir, "source")
         output_path = os.path.join(tmpdir, "output")
@@ -88,7 +89,11 @@ def test_consolidate_external_shards_uses_absolute_paths():
 
         assert ledger.finished_shards == shard_paths
         cache = TreeCache.load(output_path, EXEMPLAR_FLAT)
-        assert cache.shard_path(shard_paths[0]) == shard_paths[0]
+        dataset = TokenSeqDataset(cache, SEQ_LEN)
+
+        batch = await dataset.get_batch([0])
+
+        np.testing.assert_array_equal(batch[0], np.arange(SEQ_LEN, dtype=np.int32))
 
 
 def test_sharded_cache_rejects_duplicate_shards():
@@ -168,3 +173,25 @@ async def test_token_seq_dataset_reads_sharded_cache():
         np.testing.assert_array_equal(batch[0], np.array(all_tokens[0:4], dtype=np.int32))
         np.testing.assert_array_equal(batch[1], np.array(all_tokens[12:16], dtype=np.int32))
         np.testing.assert_array_equal(batch[2], np.array(all_tokens[16:20], dtype=np.int32))
+
+
+@pytest.mark.asyncio
+async def test_tree_cache_get_batch_reads_sharded_rows():
+    with tempfile.TemporaryDirectory(prefix="levanter-test-sharded-tree-cache-") as tmpdir:
+        shard_paths = []
+        for i in range(NUM_SHARDS):
+            shard_path = os.path.join(tmpdir, f"part-{i:05d}")
+            _build_shard_cache(shard_path, i)
+            shard_paths.append(shard_path)
+
+        consolidate_shard_caches(shard_paths, tmpdir, EXEMPLAR_FLAT)
+        cache = TreeCache.load(tmpdir, EXEMPLAR_FLAT)
+
+        batch = await cache.get_batch([0, ROWS_PER_SHARD, NUM_SHARDS * ROWS_PER_SHARD - 1])
+
+        np.testing.assert_array_equal(batch[0]["input_ids"], np.arange(ROW_WIDTH, dtype=np.int32))
+        np.testing.assert_array_equal(batch[1]["input_ids"], np.arange(ROW_WIDTH, dtype=np.int32) + 100)
+        np.testing.assert_array_equal(
+            batch[2]["input_ids"],
+            np.arange(ROW_WIDTH, dtype=np.int32) + (NUM_SHARDS - 1) * 100 + (ROWS_PER_SHARD - 1) * 10,
+        )

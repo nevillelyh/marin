@@ -1,12 +1,13 @@
 # Copyright The Levanter Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import dataclasses
 import logging as pylogging
 import os
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, TypeVar, Union
 
@@ -16,6 +17,7 @@ import jax.tree_util as jtu
 from rigging.filesystem import open_url, url_to_fs
 import numpy as np
 import pyarrow as pa
+import tensorstore as ts
 from dataclasses_json import dataclass_json
 from fray import ResourceConfig
 from fsspec import AbstractFileSystem
@@ -93,6 +95,10 @@ class TreeCache(AsyncDataset[T_co]):
         self.cache_dir = cache_dir
         self.ledger = ledger
         self._exemplar = exemplar
+        self._shard_stores: dict[str, TreeStore[T_co]] = {}
+        self._shard_row_offsets: np.ndarray | None = None
+        self._shard_field_stores: dict[tuple[str, str], Any] = {}
+        self._shard_field_offsets: dict[str, np.ndarray] = {}
 
         if not ledger.is_finished:
             raise RuntimeError(f"Cache at {cache_dir} is not finished.")
@@ -113,7 +119,7 @@ class TreeCache(AsyncDataset[T_co]):
     def is_sharded(self) -> bool:
         return self.ledger.layout == CACHE_LAYOUT_SHARDED
 
-    def shard_path(self, shard_name: str) -> str:
+    def _shard_path(self, shard_name: str) -> str:
         if "://" in shard_name:
             return shard_name
         return os.path.join(self.cache_dir, shard_name)
@@ -132,11 +138,18 @@ class TreeCache(AsyncDataset[T_co]):
         return True
 
     def __getitem__(self, item):
+        if self.is_sharded:
+            if isinstance(item, slice):
+                start, stop, step = item.indices(len(self))
+                return self.get_batch_sync(range(start, stop, step))
+            return self.get_batch_sync([item])[0]
         return self.store[item]
 
     async def get_batch(self, indices: Sequence[int] | slice):
         if isinstance(indices, slice):
             indices = range(indices.start or 0, indices.stop or len(self), indices.step or 1)
+        if self.is_sharded:
+            return await self._get_sharded_batch(indices)
         return await self.store.get_batch(indices)
 
     def get_batch_sync(self, indices_or_slice, *, timeout: Optional[float] = None):
@@ -146,7 +159,179 @@ class TreeCache(AsyncDataset[T_co]):
                 indices_or_slice.stop or len(self),
                 indices_or_slice.step or 1,
             )
+        if self.is_sharded:
+            return self._get_sharded_batch_sync(indices_or_slice)
         return self.store.get_batch_sync(indices_or_slice)
+
+    def flat_field_length(self, field: str) -> int:
+        field_count = self.ledger.field_counts.get(field)
+        if field_count is not None:
+            return field_count
+
+        if self.is_sharded:
+            if self.ledger.total_num_rows == 0:
+                return 0
+            raise ValueError(f"Sharded cache ledger missing aggregate {field} count")
+
+        return _tree_field(self.store.tree, field).data_size
+
+    async def async_flat_field_length(self, field: str) -> int:
+        field_count = self.ledger.field_counts.get(field)
+        if field_count is not None:
+            return field_count
+
+        if self.is_sharded:
+            if self.ledger.total_num_rows == 0:
+                return 0
+            raise ValueError(f"Sharded cache ledger missing aggregate {field} count")
+
+        return await _tree_field(self.store.tree, field).data_size_async()
+
+    def flat_field_num_rows(self, field: str) -> int:
+        if self.is_sharded:
+            return self.ledger.total_num_rows
+        return _tree_field(self.store.tree, field).num_rows
+
+    async def get_flat_field_batch(self, field: str, offsets: Sequence[int], length: int) -> Sequence[np.ndarray]:
+        if len(offsets) == 0:
+            return []
+
+        if self.is_sharded:
+            return await asyncio.gather(
+                *[self._get_sharded_flat_field(field, int(offset), length) for offset in offsets]
+            )
+
+        field_store = _tree_field(self.store.tree, field)
+        with ts.Batch():
+            futures = [field_store.data[int(offset) : int(offset) + length].read() for offset in offsets]
+        return await asyncio.gather(*futures)
+
+    def _ensure_shard_row_offsets(self) -> tuple[list[str], np.ndarray]:
+        if self._shard_row_offsets is not None:
+            return self.ledger.finished_shards, self._shard_row_offsets
+
+        counts = [self.ledger.shard_rows[shard_name] for shard_name in self.ledger.finished_shards]
+        self._shard_row_offsets = np.cumsum(np.array(counts, dtype=np.int64))
+        return self.ledger.finished_shards, self._shard_row_offsets
+
+    def _ensure_shard_field_offsets(self, field: str) -> tuple[list[str], np.ndarray]:
+        offsets = self._shard_field_offsets.get(field)
+        if offsets is not None:
+            return self.ledger.finished_shards, offsets
+
+        counts = []
+        for shard_name in self.ledger.finished_shards:
+            try:
+                counts.append(self.ledger.field_counts_by_shard[shard_name][field])
+            except KeyError as exc:
+                raise ValueError(f"Sharded cache ledger missing {field} count for shard {shard_name}") from exc
+
+        offsets = np.cumsum(np.array(counts, dtype=np.int64))
+        self._shard_field_offsets[field] = offsets
+        return self.ledger.finished_shards, offsets
+
+    def _shard_store(self, shard_name: str) -> TreeStore[T_co]:
+        store = self._shard_stores.get(shard_name)
+        if store is None:
+            store = TreeStore.open(self._exemplar, self._shard_path(shard_name), mode="r", cache_metadata=True)
+            self._shard_stores[shard_name] = store
+        return store
+
+    def _shard_field_store(self, shard_name: str, field: str):
+        key = (shard_name, field)
+        store = self._shard_field_stores.get(key)
+        if store is None:
+            tree_store = TreeStore.open(
+                _field_exemplar(self._exemplar, field),
+                self._shard_path(shard_name),
+                mode="r",
+                cache_metadata=True,
+            )
+            store = _tree_field(tree_store.tree, field)
+            self._shard_field_stores[key] = store
+        return store
+
+    async def _get_sharded_batch(self, indices: Sequence[int]) -> list[T_co]:
+        if len(indices) == 0:
+            return []
+
+        shard_names, shard_offsets = self._ensure_shard_row_offsets()
+        shard_batches: dict[int, list[tuple[int, int]]] = {}
+        for output_index, index in enumerate(indices):
+            index = int(index)
+            if index < 0 or index >= self.ledger.total_num_rows:
+                raise ValueError("Requested indices beyond the end of the dataset")
+
+            shard_index = int(np.searchsorted(shard_offsets, index, side="right"))
+            shard_start = int(shard_offsets[shard_index - 1]) if shard_index > 0 else 0
+            shard_batches.setdefault(shard_index, []).append((output_index, index - shard_start))
+
+        output: list[T_co | None] = [None] * len(indices)
+
+        async def read_shard(shard_index: int, batch: list[tuple[int, int]]) -> None:
+            local_indices = [local_index for _, local_index in batch]
+            shard_batch = await self._shard_store(shard_names[shard_index]).get_batch(local_indices)
+            for (output_index, _), row in zip(batch, shard_batch, strict=True):
+                output[output_index] = row
+
+        await asyncio.gather(*[read_shard(shard_index, batch) for shard_index, batch in shard_batches.items()])
+        rows = []
+        for row in output:
+            assert row is not None
+            rows.append(row)
+        return rows
+
+    def _get_sharded_batch_sync(self, indices: Sequence[int]) -> list[T_co]:
+        if len(indices) == 0:
+            return []
+
+        shard_names, shard_offsets = self._ensure_shard_row_offsets()
+        shard_batches: dict[int, list[tuple[int, int]]] = {}
+        for output_index, index in enumerate(indices):
+            index = int(index)
+            if index < 0 or index >= self.ledger.total_num_rows:
+                raise ValueError("Requested indices beyond the end of the dataset")
+
+            shard_index = int(np.searchsorted(shard_offsets, index, side="right"))
+            shard_start = int(shard_offsets[shard_index - 1]) if shard_index > 0 else 0
+            shard_batches.setdefault(shard_index, []).append((output_index, index - shard_start))
+
+        output: list[T_co | None] = [None] * len(indices)
+        for shard_index, batch in shard_batches.items():
+            local_indices = [local_index for _, local_index in batch]
+            shard_batch = self._shard_store(shard_names[shard_index]).get_batch_sync(local_indices)
+            for (output_index, _), row in zip(batch, shard_batch, strict=True):
+                output[output_index] = row
+
+        rows = []
+        for row in output:
+            assert row is not None
+            rows.append(row)
+        return rows
+
+    async def _get_sharded_flat_field(self, field: str, offset: int, length: int) -> np.ndarray:
+        shard_names, shard_offsets = self._ensure_shard_field_offsets(field)
+        remaining = length
+        position = offset
+        chunks = []
+
+        while remaining > 0:
+            shard_index = int(np.searchsorted(shard_offsets, position, side="right"))
+            if shard_index >= len(shard_names):
+                raise ValueError("Requested field offsets beyond the end of the dataset")
+
+            shard_start = int(shard_offsets[shard_index - 1]) if shard_index > 0 else 0
+            local_start = position - shard_start
+            available = int(shard_offsets[shard_index] - position)
+            take = min(remaining, available)
+            field_store = self._shard_field_store(shard_names[shard_index], field)
+            chunks.append(await field_store.data[local_start : local_start + take].read())
+            position += take
+            remaining -= take
+
+        if len(chunks) == 1:
+            return chunks[0]
+        return np.concatenate(chunks)
 
     @staticmethod
     def load(cache_dir: str, exemplar: T, options: Optional["CacheMetadata"] = None) -> "TreeCache":
@@ -243,6 +428,24 @@ def _validate_sharded_ledger(ledger: CacheLedger) -> None:
     for shard_name in ledger.field_counts_by_shard:
         if shard_name not in seen_shards:
             raise ValueError(f"Sharded cache ledger has field counts for unknown shard {shard_name}")
+
+
+def _tree_field(tree, field: str):
+    value = tree
+    for part in field.split("/"):
+        if isinstance(value, Mapping):
+            value = value[part]
+        elif isinstance(value, (list, tuple)):
+            value = value[int(part)]
+        else:
+            value = getattr(value, part)
+    return value
+
+
+def _field_exemplar(exemplar, field: str):
+    if "/" not in field and isinstance(exemplar, Mapping):
+        return {field: exemplar[field]}
+    return exemplar
 
 
 @dataclass_json

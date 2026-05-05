@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import abc
-import asyncio
 import dataclasses
 import functools
 import logging
@@ -16,7 +15,6 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
-import tensorstore as ts
 from draccus import ChoiceRegistry, field
 from haliax import Axis
 from jaxtyping import PRNGKeyArray
@@ -47,8 +45,6 @@ from levanter.data.text.formats import (
 from levanter.models.lm_model import LmExample
 from levanter.schedule import BatchSchedule
 from levanter.store.cache import CacheOptions, TreeCache
-from levanter.store.jagged_array import JaggedArrayStore
-from levanter.store.tree_store import TreeStore
 from levanter.utils import fsspec_utils
 from levanter.tokenizers import MarinTokenizer, load_tokenizer as load_marin_tokenizer
 from levanter.utils.jax_utils import key_iterator
@@ -73,28 +69,9 @@ class TokenSeqDataset(AsyncDataset[np.ndarray]):
     def __init__(self, doc_cache: TreeCache[dict], seq_len: int):
         self.doc_cache = doc_cache
         self.seq_len = seq_len
-        self._store: TreeStore | None = None if doc_cache.is_sharded else doc_cache.store
-        self._shard_token_stores: dict[str, JaggedArrayStore] = {}
-        self._shard_token_counts: np.ndarray | None = None
-        self._shard_token_offsets: np.ndarray | None = None
 
     async def async_len(self) -> int:
-        token_count = self.doc_cache.ledger.field_counts.get("input_ids")
-        if token_count is not None:
-            return token_count // self.seq_len
-
-        if self.doc_cache.is_sharded:
-            if self.doc_cache.ledger.total_num_rows == 0:
-                return 0
-            raise ValueError("Sharded cache ledger missing aggregate input_ids count")
-
-        token_arrays = await self._await_token_cache()
-        return token_arrays.data_size // self.seq_len
-
-    async def _await_token_cache(self) -> JaggedArrayStore:
-        if self._store is None:
-            self._store = self.doc_cache.store
-        return self._store.tree["input_ids"]
+        return await self.doc_cache.async_flat_field_length("input_ids") // self.seq_len
 
     def is_finite(self) -> bool:
         return True
@@ -107,72 +84,8 @@ class TokenSeqDataset(AsyncDataset[np.ndarray]):
         if ds_len < max(indices) + 1:
             raise ValueError("Requested indices beyond the end of the dataset")
 
-        if self.doc_cache.is_sharded:
-            return await asyncio.gather(*[self._get_sharded_sequence(int(index) * self.seq_len) for index in indices])
-
-        token_arrays = await self._await_token_cache()
-        # logger.info(f"Time to get token cache: {time.time() - time_in}")
         offsets = np.array(indices, dtype=np.int64) * self.seq_len
-        with ts.Batch():
-            out = []
-            for offset in offsets:
-                out.append(token_arrays.data[offset : offset + self.seq_len].read())
-
-        out = await asyncio.gather(*out)
-        return out
-
-    def _ensure_shard_token_offsets(self) -> tuple[list[str], np.ndarray]:
-        if self._shard_token_offsets is not None:
-            return self.doc_cache.ledger.finished_shards, self._shard_token_offsets
-
-        shard_names = self.doc_cache.ledger.finished_shards
-        counts = []
-        for shard_name in shard_names:
-            try:
-                counts.append(self.doc_cache.ledger.field_counts_by_shard[shard_name]["input_ids"])
-            except KeyError as exc:
-                raise ValueError(f"Sharded cache ledger missing input_ids count for shard {shard_name}") from exc
-
-        self._shard_token_counts = np.array(counts, dtype=np.int64)
-        self._shard_token_offsets = np.cumsum(self._shard_token_counts)
-        return shard_names, self._shard_token_offsets
-
-    def _shard_token_store(self, shard_name: str) -> JaggedArrayStore:
-        store = self._shard_token_stores.get(shard_name)
-        if store is None:
-            tree_store = TreeStore.open(
-                {"input_ids": np.array([0], dtype=np.int32)},
-                self.doc_cache.shard_path(shard_name),
-                mode="r",
-                cache_metadata=True,
-            )
-            store = tree_store.tree["input_ids"]
-            self._shard_token_stores[shard_name] = store
-        return store
-
-    async def _get_sharded_sequence(self, offset: int) -> np.ndarray:
-        shard_names, shard_offsets = self._ensure_shard_token_offsets()
-        remaining = self.seq_len
-        position = offset
-        chunks = []
-
-        while remaining > 0:
-            shard_index = int(np.searchsorted(shard_offsets, position, side="right"))
-            if shard_index >= len(shard_names):
-                raise ValueError("Requested indices beyond the end of the dataset")
-
-            shard_start = int(shard_offsets[shard_index - 1]) if shard_index > 0 else 0
-            local_start = position - shard_start
-            available = int(shard_offsets[shard_index] - position)
-            take = min(remaining, available)
-            token_store = self._shard_token_store(shard_names[shard_index])
-            chunks.append(await token_store.data[local_start : local_start + take].read())
-            position += take
-            remaining -= take
-
-        if len(chunks) == 1:
-            return chunks[0]
-        return np.concatenate(chunks)
+        return await self.doc_cache.get_flat_field_batch("input_ids", offsets, self.seq_len)
 
 
 def _single_cpu_sharding() -> jax.sharding.SingleDeviceSharding:
@@ -987,7 +900,7 @@ def count_corpus_sizes(
     prefix: str = "data/stats/",
     seq_len: int = 4096,
 ) -> dict:
-    stats = {}
+    stats: dict[str, int | float] = {}
     train_caches = config.build_caches("train")
     Pos = Axis("position", seq_len)
 
@@ -1004,8 +917,9 @@ def count_corpus_sizes(
         metric_prefix = f"{prefix}train/{name}/"
         component = config.components[name]
         token_key = _get_token_key_for_component(component)
-        stats[f"{metric_prefix}total_tokens"] = cache.store.tree[token_key].data_size
-        stats[f"{metric_prefix}total_docs"] = cache.store.tree[token_key].num_rows
+        total_tokens = cache.flat_field_length(token_key)
+        stats[f"{metric_prefix}total_tokens"] = total_tokens
+        stats[f"{metric_prefix}total_docs"] = cache.flat_field_num_rows(token_key)
         train_set = dataset_for_component(
             component,
             Pos,
@@ -1015,7 +929,7 @@ def count_corpus_sizes(
         )
         train_seqs = len(train_set.as_sync_dataset())
         stats[f"{metric_prefix}total_seqs"] = train_seqs
-        padding_fraction = 1 - (cache.store.tree[token_key].data_size / (train_seqs * seq_len))
+        padding_fraction = 1 - (total_tokens / (train_seqs * seq_len))
         if padding_fraction < 0:
             stats[f"{metric_prefix}truncation_fraction"] = -padding_fraction
         else:
@@ -1031,8 +945,8 @@ def count_corpus_sizes(
         metric_prefix = f"{prefix}validation/{name}/"
         component = config.components[name]
         token_key = _get_token_key_for_component(component)
-        stats[f"{metric_prefix}total_tokens"] = cache.store.tree[token_key].data_size
-        stats[f"{metric_prefix}total_docs"] = cache.store.tree[token_key].num_rows
+        stats[f"{metric_prefix}total_tokens"] = cache.flat_field_length(token_key)
+        stats[f"{metric_prefix}total_docs"] = cache.flat_field_num_rows(token_key)
         validation_set = dataset_for_component(
             component,
             Pos,
