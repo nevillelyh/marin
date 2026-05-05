@@ -179,24 +179,23 @@ class Table:
         *,
         namespace: str,
         schema: Schema,
-        flusher: Callable[[str, list[Any]], None],
+        flusher: Callable[[str, pa.RecordBatch], None],
         querier: Callable[[str], pa.Table] | None = None,
         flush_interval: float = DEFAULT_FLUSH_INTERVAL,
         batch_rows: int = DEFAULT_BATCH_ROWS,
         max_buffer_bytes: int = DEFAULT_MAX_BUFFER_BYTES,
         max_buffer_rows: int = DEFAULT_BATCH_ROWS,
         thread_name: str | None = None,
-        row_encoder: Callable[[Any], tuple[Any, int]],
     ) -> None:
         self._namespace = namespace
         self._schema = schema
+        self._arrow_schema = schema_to_arrow(schema)
         self._flusher = flusher
         self._querier = querier
         self._flush_interval = flush_interval
         self._batch_rows = batch_rows
         self._max_buffer_bytes = max_buffer_bytes
         self._max_buffer_rows = max_buffer_rows
-        self._row_encoder = row_encoder
 
         self._cond = threading.Condition()
         self._queue: deque[_PendingItem] = deque()
@@ -227,17 +226,22 @@ class Table:
         return self._schema
 
     def write(self, rows: Iterable[Any]) -> None:
-        """Buffer ``rows`` for write. Never blocks the caller."""
+        """Buffer ``rows`` for write. Never blocks the caller.
+
+        Caller-side cost is a cheap byte estimate per row plus an enqueue —
+        Arrow construction is deferred to the bg flush thread so a single
+        producer batch is encoded once instead of once per row.
+        """
         rows_list = list(rows)
         if not rows_list:
             return
+        sizes = [_estimate_row_size(row, self._schema.columns) for row in rows_list]
         with self._cond:
             if self._closing or self._closed:
                 raise RuntimeError(f"Table({self._namespace}) is closed")
-            for row in rows_list:
-                payload, size = self._row_encoder(row)
+            for row, size in zip(rows_list, sizes, strict=True):
                 self._pushed_seq += 1
-                self._queue.append(_PendingItem(self._pushed_seq, payload, size))
+                self._queue.append(_PendingItem(self._pushed_seq, row, size))
                 self._queue_bytes += size
             self._trim_oldest_locked()
             if len(self._queue) >= self._batch_rows or self._queue_bytes >= self._max_buffer_bytes:
@@ -366,12 +370,18 @@ class Table:
                     self._cond.wait(timeout=remaining)
 
     def _send(self, items: list[_PendingItem]) -> tuple[int, list[_PendingItem]]:
-        """Send ``items`` via the flusher. Returns ``(max_sent_seq, unsent)``."""
+        """Send ``items`` via the flusher. Returns ``(max_sent_seq, unsent)``.
+
+        Builds the entire batch's RecordBatch in one pass on the bg thread,
+        amortizing Arrow construction across the whole queue rather than
+        per-row at write time.
+        """
         if not items:
             return 0, []
-        payloads = [item.payload for item in items]
+        rows = [item.payload for item in items]
         try:
-            self._flusher(self._namespace, payloads)
+            batch = _rows_to_record_batch(rows, self._arrow_schema, self._schema)
+            self._flusher(self._namespace, batch)
         except Exception as exc:
             retryable = is_retryable_error(exc) or isinstance(exc, (ConnectionError, OSError, TimeoutError))
             summary = _format_exc_summary(exc)
@@ -529,13 +539,11 @@ class LogClient:
         except ConnectError as exc:
             raise _translate_connect_error(exc) from exc
         effective = schema_from_proto(response.effective_schema)
-        arrow_schema = schema_to_arrow(effective)
         table = Table(
             namespace=namespace,
             schema=effective,
-            flusher=lambda ns, rows: self._stats_flush(ns, rows),
+            flusher=self._stats_flush,
             querier=self._stats_query,
-            row_encoder=_make_stats_row_encoder(arrow_schema, effective),
         )
         with self._lock:
             if self._closed:
@@ -579,7 +587,6 @@ class LogClient:
                 namespace=LOG_NAMESPACE,
                 schema=LOG_REGISTERED_SCHEMA,
                 flusher=self._stats_flush,
-                row_encoder=_make_stats_row_encoder(schema_to_arrow(LOG_REGISTERED_SCHEMA), LOG_REGISTERED_SCHEMA),
                 thread_name="finelog-log-client",
             )
             self._tables[LOG_NAMESPACE] = tbl
@@ -649,11 +656,10 @@ class LogClient:
         reader = paipc.open_stream(pa.BufferReader(bytes(response.arrow_ipc)))
         return reader.read_all()
 
-    def _stats_flush(self, namespace: str, batches: list[Any]) -> None:
-        combined = pa.concat_batches(batches)
+    def _stats_flush(self, namespace: str, batch: pa.RecordBatch) -> None:
         sink = io.BytesIO()
-        with paipc.new_stream(sink, combined.schema) as writer:
-            writer.write_batch(combined)
+        with paipc.new_stream(sink, batch.schema) as writer:
+            writer.write_batch(batch)
         batch_bytes = sink.getvalue()
         client = self._get_stats_client()
         try:
@@ -672,37 +678,54 @@ class LogClient:
 # ---------------------------------------------------------------------------
 
 
-def _row_to_record_batch(row: Any, arrow_schema: pa.Schema, schema: Schema) -> pa.RecordBatch:
-    """Convert a single dataclass (or attribute-bearing) row to a 1-row RecordBatch.
+def _rows_to_record_batch(rows: list[Any], arrow_schema: pa.Schema, schema: Schema) -> pa.RecordBatch:
+    """Build a single RecordBatch from ``rows``.
+
+    Builds one Arrow array per column for the entire batch — much cheaper
+    than constructing a 1-row RecordBatch per row and concatenating later.
 
     Missing or None values for non-nullable columns raise
     :class:`SchemaValidationError`; nullable columns become NULL.
     """
+    n = len(rows)
     columns: list[pa.Array] = []
     for col, field in zip(schema.columns, arrow_schema, strict=True):
-        value = getattr(row, col.name, None)
-        if value is None:
-            if not col.nullable:
-                raise SchemaValidationError(f"row missing required (non-nullable) column {col.name!r}")
-            raw: list[Any] = [None]
+        values: list[Any] = [None] * n
+        if col.nullable:
+            for i, row in enumerate(rows):
+                values[i] = getattr(row, col.name, None)
         else:
-            raw = [value]
+            for i, row in enumerate(rows):
+                v = getattr(row, col.name, None)
+                if v is None:
+                    raise SchemaValidationError(f"row missing required (non-nullable) column {col.name!r}")
+                values[i] = v
         try:
-            arr = pa.array(raw, type=field.type, from_pandas=False)
+            arr = pa.array(values, type=field.type, from_pandas=False)
         except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError, ValueError) as exc:
             raise SchemaValidationError(
-                f"column {col.name!r}: failed to encode row as " f"{stats_pb2.ColumnType.Name(col.type)}: {exc}"
+                f"column {col.name!r}: failed to encode batch as " f"{stats_pb2.ColumnType.Name(col.type)}: {exc}"
             ) from exc
         columns.append(arr)
     return pa.RecordBatch.from_arrays(columns, schema=arrow_schema)
 
 
-def _make_stats_row_encoder(arrow_schema: pa.Schema, schema: Schema) -> Callable[[Any], tuple[pa.RecordBatch, int]]:
-    def encode(row: Any) -> tuple[pa.RecordBatch, int]:
-        batch = _row_to_record_batch(row, arrow_schema, schema)
-        return batch, batch.nbytes
+def _estimate_row_size(row: Any, columns: tuple[Column, ...]) -> int:
+    """Cheap byte estimate for buffer-cap accounting.
 
-    return encode
+    Strings count their length; everything else is treated as 8 bytes. This
+    is rough on purpose — the buffer cap only needs an order-of-magnitude
+    estimate, and the real Arrow encode runs once per batch on the flush
+    thread.
+    """
+    total = 0
+    for col in columns:
+        v = getattr(row, col.name, None)
+        if isinstance(v, str):
+            total += len(v)
+        else:
+            total += 8
+    return total
 
 
 def _log_entries_to_rows(key: str, messages: Sequence[logging_pb2.LogEntry]) -> list[Any]:
