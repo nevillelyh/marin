@@ -24,7 +24,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Condition, Lock
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 import duckdb
 import fsspec.core
@@ -35,6 +35,12 @@ from rigging.timing import RateLimiter
 
 from finelog.rpc import finelog_stats_pb2 as stats_pb2
 from finelog.rpc import logging_pb2
+from finelog.store.catalog import (
+    Catalog,
+    NamespaceStats,
+    SegmentRow,
+    SegmentState,
+)
 from finelog.store.rwlock import RWLock
 from finelog.store.schema import (
     IMPLICIT_SEQ_COLUMN,
@@ -103,20 +109,34 @@ def _min_seq_from_filename(name: str) -> int | None:
     return int(match.group(1))
 
 
-def _read_seq_bounds(path: Path) -> tuple[int, int]:
-    """Compute (min_seq, max_seq) for a segment via filename + parquet metadata."""
+class SegmentMetadata(NamedTuple):
+    """``(min_seq, max_seq, row_count)`` derived from a segment's filename + parquet footer."""
+
+    min_seq: int
+    max_seq: int
+    row_count: int
+
+
+_EMPTY_SEGMENT_METADATA = SegmentMetadata(min_seq=0, max_seq=0, row_count=0)
+
+
+def _read_segment_metadata(path: Path) -> SegmentMetadata:
+    """Recover ``(min_seq, max_seq, row_count)`` from filename + parquet footer.
+
+    Returns ``_EMPTY_SEGMENT_METADATA`` for unparseable filenames or footer-read
+    failures — the caller treats that as an empty/discardable segment.
+    """
     min_seq = _min_seq_from_filename(path.name)
     if min_seq is None:
-        return 0, 0
+        return _EMPTY_SEGMENT_METADATA
     try:
-        meta = pq.read_metadata(path)
-        num_rows = meta.num_rows
+        num_rows = pq.read_metadata(path).num_rows
     except Exception:
         logger.warning("Failed to read parquet metadata for %s; treating as empty", path, exc_info=True)
-        return 0, 0
+        return _EMPTY_SEGMENT_METADATA
     if num_rows <= 0:
-        return min_seq, min_seq
-    return min_seq, min_seq + num_rows - 1
+        return SegmentMetadata(min_seq=min_seq, max_seq=min_seq, row_count=0)
+    return SegmentMetadata(min_seq=min_seq, max_seq=min_seq + num_rows - 1, row_count=num_rows)
 
 
 def _discover_segments(log_dir: Path) -> list[Path]:
@@ -126,9 +146,9 @@ def _discover_segments(log_dir: Path) -> list[Path]:
 def _recover_next_seq(log_dir: Path) -> int:
     next_seq = 1
     for p in _discover_segments(log_dir):
-        _, max_seq = _read_seq_bounds(p)
-        if max_seq + 1 > next_seq:
-            next_seq = max_seq + 1
+        meta = _read_segment_metadata(p)
+        if meta.max_seq + 1 > next_seq:
+            next_seq = meta.max_seq + 1
     return next_seq
 
 
@@ -159,8 +179,9 @@ class _SealedBuffer:
 class LocalSegment:
     path: str
     size_bytes: int
-    min_seq: int = 0
-    max_seq: int = 0
+    min_seq: int
+    max_seq: int
+    row_count: int
 
 
 def _stamp_seq_column(batch: pa.RecordBatch, first_seq: int, arrow_schema: pa.Schema) -> pa.Table:
@@ -219,6 +240,7 @@ class RamBuffers:
         self._flushing: _SealedBuffer | None = None
         self._next_seq = next_seq
         self._ram_bytes = 0
+        self._ram_rows = 0
 
     @property
     def next_seq(self) -> int:
@@ -234,10 +256,15 @@ class RamBuffers:
         self._chunks.append(table)
         self._chunks = _merge_chunks(self._chunks)
         self._ram_bytes += added
+        self._ram_rows += table.num_rows
 
     def ram_bytes(self) -> int:
         flushing_b = self._flushing.table.nbytes if self._flushing is not None else 0
         return self._ram_bytes + flushing_b
+
+    def ram_rows(self) -> int:
+        flushing_n = self._flushing.table.num_rows if self._flushing is not None else 0
+        return self._ram_rows + flushing_n
 
     def chunk_count(self) -> int:
         return len(self._chunks)
@@ -256,6 +283,7 @@ class RamBuffers:
         tables = self._chunks
         self._chunks = []
         self._ram_bytes = 0
+        self._ram_rows = 0
         visible_table = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
         seq_col = visible_table.column(IMPLICIT_SEQ_COLUMN)
         sealed = _SealedBuffer(
@@ -277,6 +305,7 @@ class RamBuffers:
         table = self._flushing.table
         self._chunks.insert(0, table)
         self._ram_bytes += table.nbytes
+        self._ram_rows += table.num_rows
         self._flushing = None
 
     def query_snapshot(self) -> list[pa.Table]:
@@ -323,6 +352,8 @@ class LogNamespaceProtocol(Protocol):
 
     def stop_and_join(self) -> None: ...
 
+    def stats(self) -> NamespaceStats: ...
+
 
 class DiskLogNamespace:
     """Disk-backed per-namespace storage.
@@ -348,6 +379,7 @@ class DiskLogNamespace:
         query_visibility_lock: RWLock,
         compaction_conn: duckdb.DuckDBPyConnection,
         read_pool: _ReadPoolProtocol,
+        catalog: Catalog,
         evict_hook: Callable[[], None] = lambda: None,
     ) -> None:
         self.name = name
@@ -369,6 +401,7 @@ class DiskLogNamespace:
 
         self._compaction_conn = compaction_conn
         self._read_pool = read_pool
+        self._catalog = catalog
 
         self._buffers = RamBuffers(
             arrow_schema=self._arrow_schema,
@@ -381,13 +414,14 @@ class DiskLogNamespace:
         # fully covered by a logs_ segment is a duplicate.
         discovered: list[LocalSegment] = []
         for p in _discover_segments(data_dir):
-            min_seq, max_seq = _read_seq_bounds(p)
+            meta = _read_segment_metadata(p)
             discovered.append(
                 LocalSegment(
                     path=str(p),
                     size_bytes=p.stat().st_size,
-                    min_seq=min_seq,
-                    max_seq=max_seq,
+                    min_seq=meta.min_seq,
+                    max_seq=meta.max_seq,
+                    row_count=meta.row_count,
                 )
             )
         log_ranges = [(s.min_seq, s.max_seq) for s in discovered if not _is_tmp_path(s.path)]
@@ -400,6 +434,16 @@ class DiskLogNamespace:
                     logger.warning("Failed to unlink stale tmp segment %s", s.path, exc_info=True)
                 continue
             self._local_segments.append(s)
+
+        # Reconcile the persistent catalog against the on-disk segment set.
+        # Parquet files are authoritative across crashes; the catalog rows
+        # for this namespace get rewritten to match exactly what's on disk
+        # right now so future reads from the catalog always agree with
+        # ``query_snapshot()``.
+        self._catalog.reconcile_segments(
+            self.name,
+            [self._segment_to_row(seg) for seg in self._local_segments],
+        )
 
         self._flush_rl = RateLimiter(flush_interval_sec)
         self._compaction_rl = RateLimiter(compaction_interval_sec)
@@ -651,6 +695,20 @@ class DiskLogNamespace:
             return (self.schema.key_column, IMPLICIT_SEQ_COLUMN)
         return (IMPLICIT_SEQ_COLUMN,)
 
+    def _segment_to_row(self, seg: LocalSegment) -> SegmentRow:
+        """Build the catalog row that mirrors ``seg``."""
+        state = SegmentState.TMP if _is_tmp_path(seg.path) else SegmentState.FINALIZED
+        return SegmentRow(
+            namespace=self.name,
+            path=seg.path,
+            state=state,
+            min_seq=seg.min_seq,
+            max_seq=seg.max_seq,
+            row_count=seg.row_count,
+            byte_size=seg.size_bytes,
+            created_at_ms=int(time.time() * 1000),
+        )
+
     def _write_new_segment(self, sealed: _SealedBuffer) -> None:
         filename = _tmp_filename(sealed.min_seq)
         write_start = time.monotonic()
@@ -678,11 +736,13 @@ class DiskLogNamespace:
             size_bytes=filepath.stat().st_size,
             min_seq=sealed.min_seq,
             max_seq=sealed.max_seq,
+            row_count=sealed.table.num_rows,
         )
 
         with self._insertion_lock:
             self._local_segments.append(seg)
             self._buffers.commit_flush()
+            self._catalog.upsert_segment(self._segment_to_row(seg))
 
         logger.info(
             "Wrote tmp segment %s: rows=%d bytes=%d seq=[%d,%d] elapsed_ms=%d",
@@ -723,6 +783,7 @@ class DiskLogNamespace:
             size_bytes=staging_path.stat().st_size,
             min_seq=min_seq,
             max_seq=max_seq,
+            row_count=sum(t.row_count for t in tmps),
         )
 
         tmp_paths = {t.path for t in tmps}
@@ -743,6 +804,11 @@ class DiskLogNamespace:
                 if not merged_inserted:
                     new_segments.append(merged_seg)
                 self._local_segments = new_segments
+                self._catalog.replace_segments(
+                    self.name,
+                    removed_paths=list(tmp_paths),
+                    added=[self._segment_to_row(merged_seg)],
+                )
             for t in tmps:
                 try:
                     Path(t.path).unlink(missing_ok=True)
@@ -831,6 +897,7 @@ class DiskLogNamespace:
                     continue
                 new.append(s)
             self._local_segments = new
+            self._catalog.remove_segment(self.name, path)
         try:
             Path(path).unlink(missing_ok=True)
         except OSError:
@@ -845,6 +912,8 @@ class DiskLogNamespace:
             except OSError:
                 logger.warning("Failed to delete %s during drop", s.path, exc_info=True)
         self._local_segments.clear()
+        # The catalog row for this namespace is dropped by ``Catalog.delete``
+        # in :meth:`DuckDBLogStore.drop_table`; segments are cascaded there too.
         # Sweep stragglers (e.g. half-written .parquet.tmp) before rmdir.
         for p in list(self._data_dir.glob("*")):
             try:
@@ -855,6 +924,36 @@ class DiskLogNamespace:
             self._data_dir.rmdir()
         except OSError:
             logger.warning("Namespace dir %s not empty after drop", self._data_dir)
+
+    def stats(self) -> NamespaceStats:
+        """Aggregate row/byte/seq stats over sealed segments + RAM buffer.
+
+        Read straight from in-memory state (which is held in lockstep with
+        the catalog) so the call is O(local_segments) and serves dashboard
+        list requests without touching parquet.
+        """
+        with self._insertion_lock:
+            if not self._local_segments and self._buffers.ram_rows() == 0:
+                return NamespaceStats.empty()
+            seg_rows = sum(s.row_count for s in self._local_segments)
+            seg_bytes = sum(s.size_bytes for s in self._local_segments)
+            seg_min = min((s.min_seq for s in self._local_segments if s.row_count > 0), default=0)
+            seg_max = max((s.max_seq for s in self._local_segments if s.row_count > 0), default=0)
+            ram_rows = self._buffers.ram_rows()
+            ram_bytes = self._buffers.ram_bytes()
+            next_seq = self._buffers.next_seq
+        # The seq counter is the high-water mark; ``ram_rows`` rows occupy
+        # ``[next_seq - ram_rows, next_seq - 1]``. If everything is in RAM
+        # (cold start before any flush) this gives a correct seq window too.
+        min_seq = seg_min if seg_min else (next_seq - ram_rows if ram_rows else 0)
+        max_seq = max(seg_max, next_seq - 1) if (seg_max or ram_rows) else 0
+        return NamespaceStats(
+            row_count=seg_rows + ram_rows,
+            byte_size=seg_bytes + ram_bytes,
+            min_seq=min_seq,
+            max_seq=max_seq,
+            segment_count=len(self._local_segments),
+        )
 
     def _offload_to_gcs(self, filename: str, filepath: Path) -> None:
         if not self._remote_log_dir:
@@ -1058,6 +1157,21 @@ class MemoryLogNamespace:
 
     def stop_and_join(self) -> None:
         return
+
+    def stats(self) -> NamespaceStats:
+        with self._insertion_lock:
+            num_rows = self._table.num_rows
+            byte_size = self._table.nbytes
+            next_seq = self._next_seq
+        if num_rows == 0:
+            return NamespaceStats.empty()
+        return NamespaceStats(
+            row_count=num_rows,
+            byte_size=byte_size,
+            min_seq=max(next_seq - num_rows, 1),
+            max_seq=next_seq - 1,
+            segment_count=0,
+        )
 
 
 class _ReadPoolProtocol(Protocol):
