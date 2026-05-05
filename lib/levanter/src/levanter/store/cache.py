@@ -98,7 +98,9 @@ class TreeCache(AsyncDataset[T_co]):
             raise RuntimeError(f"Cache at {cache_dir} is not finished.")
 
         self._store = None
-        if not self.is_sharded:
+        if self.is_sharded:
+            _validate_sharded_ledger(ledger)
+        else:
             self._store = TreeStore.open(self._exemplar, self.cache_dir, mode="r", cache_metadata=False)
 
     @property
@@ -214,6 +216,33 @@ class CacheLedger:
     def _serialize_and_commit(self, cache_dir):
         path = os.path.join(cache_dir, LEDGER_FILE_NAME)
         return _serialize_json_and_commit(path, self)  # type: ignore[arg-type]
+
+
+def _validate_sharded_ledger(ledger: CacheLedger) -> None:
+    seen_shards: set[str] = set()
+    total_num_rows = 0
+    for shard_name in ledger.finished_shards:
+        if shard_name in seen_shards:
+            raise ValueError(f"Sharded cache ledger contains duplicate shard {shard_name}")
+        seen_shards.add(shard_name)
+
+        if shard_name not in ledger.shard_rows:
+            raise ValueError(f"Sharded cache ledger missing row count for shard {shard_name}")
+
+        num_rows = ledger.shard_rows[shard_name]
+        if num_rows < 0:
+            raise ValueError(f"Sharded cache ledger has negative row count for shard {shard_name}: {num_rows}")
+        total_num_rows += num_rows
+
+    if total_num_rows != ledger.total_num_rows:
+        raise ValueError(
+            "Sharded cache ledger row count mismatch: "
+            f"sum(finished shard rows)={total_num_rows}, total_num_rows={ledger.total_num_rows}"
+        )
+
+    for shard_name in ledger.field_counts_by_shard:
+        if shard_name not in seen_shards:
+            raise ValueError(f"Sharded cache ledger has field counts for unknown shard {shard_name}")
 
 
 @dataclass_json
@@ -545,6 +574,9 @@ def _merge_ledgers(
     )
     for shard_path, ledger, field_counts in zip(shard_cache_paths, shard_ledgers, per_shard_field_counts, strict=True):
         shard_name = _relative_shard_path(output_path, shard_path)
+        if shard_name in final_ledger.shard_rows:
+            raise ValueError(f"Multiple shard cache paths resolve to the same ledger shard path: {shard_name}")
+
         final_ledger.shard_rows[shard_name] = ledger.total_num_rows
         final_ledger.finished_shards.append(shard_name)
         final_ledger.total_num_rows += ledger.total_num_rows
@@ -553,6 +585,7 @@ def _merge_ledgers(
             final_ledger.field_counts[field] = final_ledger.field_counts.get(field, 0) + count
 
     final_ledger.is_finished = True
+    _validate_sharded_ledger(final_ledger)
     final_ledger._serialize_and_commit(output_path)
     return final_ledger
 
@@ -619,9 +652,12 @@ def _relative_shard_path(output_path: str, shard_path: str) -> str:
             return shard_path[len(prefix) :]
         return shard_path
     try:
-        return os.path.relpath(shard_path, output_path)
+        relative_path = os.path.relpath(shard_path, output_path)
     except ValueError:
         return shard_path
+    if relative_path == os.pardir or relative_path.startswith(os.pardir + os.sep):
+        return shard_path
+    return relative_path
 
 
 def _field_counts_from_store(store: TreeStore) -> dict[str, int]:

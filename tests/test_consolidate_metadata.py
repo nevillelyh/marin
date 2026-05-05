@@ -14,6 +14,7 @@ from levanter.store.cache import (
     CacheLedger,
     TreeCache,
     _expose_cache_rows,
+    _relative_shard_path,
     consolidate_shard_caches,
 )
 from levanter.store.tree_store import TreeStore
@@ -61,6 +62,87 @@ def test_consolidate_shard_caches_writes_only_ledger():
 
         with pytest.raises(FileNotFoundError):
             TreeStore.open(EXEMPLAR_FLAT, tmpdir, mode="r", cache_metadata=True)
+
+
+def test_relative_shard_path_keeps_external_local_paths_absolute():
+    with tempfile.TemporaryDirectory(prefix="levanter-test-shard-paths-") as tmpdir:
+        output_path = os.path.join(tmpdir, "output")
+        internal_shard = os.path.join(output_path, "part-00000")
+        external_shard = os.path.join(tmpdir, "source", "part-00000")
+
+        assert _relative_shard_path(output_path, internal_shard) == "part-00000"
+        assert _relative_shard_path(output_path, external_shard) == external_shard
+
+
+def test_consolidate_external_shards_uses_absolute_paths():
+    with tempfile.TemporaryDirectory(prefix="levanter-test-external-shards-") as tmpdir:
+        source_dir = os.path.join(tmpdir, "source")
+        output_path = os.path.join(tmpdir, "output")
+        shard_paths = []
+        for i in range(NUM_SHARDS):
+            shard_path = os.path.join(source_dir, f"part-{i:05d}")
+            _build_shard_cache(shard_path, i)
+            shard_paths.append(shard_path)
+
+        ledger = consolidate_shard_caches(shard_paths, output_path, EXEMPLAR_FLAT)
+
+        assert ledger.finished_shards == shard_paths
+        cache = TreeCache.load(output_path, EXEMPLAR_FLAT)
+        assert cache.shard_path(shard_paths[0]) == shard_paths[0]
+
+
+def test_sharded_cache_rejects_duplicate_shards():
+    ledger = CacheLedger(
+        total_num_rows=2,
+        shard_rows={"part-00000": 1},
+        is_finished=True,
+        finished_shards=["part-00000", "part-00000"],
+        layout=CACHE_LAYOUT_SHARDED,
+    )
+
+    with pytest.raises(ValueError, match="duplicate shard"):
+        TreeCache("unused", EXEMPLAR_FLAT, ledger)
+
+
+def test_sharded_cache_requires_row_counts_for_finished_shards():
+    ledger = CacheLedger(
+        total_num_rows=1,
+        shard_rows={},
+        is_finished=True,
+        finished_shards=["part-00000"],
+        layout=CACHE_LAYOUT_SHARDED,
+    )
+
+    with pytest.raises(ValueError, match="missing row count"):
+        TreeCache("unused", EXEMPLAR_FLAT, ledger)
+
+
+def test_sharded_cache_rejects_total_row_mismatch():
+    ledger = CacheLedger(
+        total_num_rows=2,
+        shard_rows={"part-00000": 1},
+        is_finished=True,
+        finished_shards=["part-00000"],
+        layout=CACHE_LAYOUT_SHARDED,
+    )
+
+    with pytest.raises(ValueError, match="row count mismatch"):
+        TreeCache("unused", EXEMPLAR_FLAT, ledger)
+
+
+@pytest.mark.asyncio
+async def test_empty_sharded_token_seq_len_is_zero():
+    ledger = CacheLedger(
+        total_num_rows=0,
+        shard_rows={},
+        is_finished=True,
+        finished_shards=[],
+        layout=CACHE_LAYOUT_SHARDED,
+    )
+    cache = TreeCache("unused", EXEMPLAR_FLAT, ledger)
+    dataset = TokenSeqDataset(cache, SEQ_LEN)
+
+    assert await dataset.async_len() == 0
 
 
 @pytest.mark.asyncio

@@ -83,6 +83,11 @@ class TokenSeqDataset(AsyncDataset[np.ndarray]):
         if token_count is not None:
             return token_count // self.seq_len
 
+        if self.doc_cache.is_sharded:
+            if self.doc_cache.ledger.total_num_rows == 0:
+                return 0
+            raise ValueError("Sharded cache ledger missing aggregate input_ids count")
+
         token_arrays = await self._await_token_cache()
         return token_arrays.data_size // self.seq_len
 
