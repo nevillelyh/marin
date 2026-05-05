@@ -1,12 +1,8 @@
 # Copyright The Levanter Authors
 # SPDX-License-Identifier: Apache-2.0
 
-import asyncio
-import copy
 import dataclasses
-import gc
 import logging as pylogging
-import operator
 import os
 import threading
 import time
@@ -16,14 +12,13 @@ from typing import Any, Dict, List, Optional, Sequence, TypeVar, Union
 
 import deepdiff
 import jax
+import jax.tree_util as jtu
 from rigging.filesystem import open_url, url_to_fs
 import numpy as np
 import pyarrow as pa
-import tensorstore as ts
 from dataclasses_json import dataclass_json
 from fray import ResourceConfig
 from fsspec import AbstractFileSystem
-from jaxtyping import PyTree
 from tqdm_loggable.tqdm_logging import tqdm_logging
 from zephyr import Dataset, ZephyrContext
 from zephyr import counters as zephyr_counters
@@ -34,9 +29,7 @@ from levanter.utils.jax_utils import broadcast_one_to_all
 
 from ..data._preprocessor import BatchProcessor, BatchResult, dict_from_record_batch
 from ..data.sharded_datasource import ShardedDataSource
-from ..utils.fsspec_utils import exists as fsspec_exists
-from ..utils.fsspec_utils import remove as fsspec_remove
-from .jagged_array import JaggedArrayStore, _no_cache_read_context
+from .jagged_array import _no_cache_read_context
 from .tree_store import TreeStore
 
 T = TypeVar("T")
@@ -47,6 +40,8 @@ logger = pylogging.getLogger(__name__)
 
 LEDGER_FILE_NAME = "shard_ledger.json"
 CONSOLIDATE_DATA_SIZE_WORKERS = 32
+CACHE_LAYOUT_CONSOLIDATED = "consolidated"
+CACHE_LAYOUT_SHARDED = "sharded"
 
 DEFAULT_LOG_LEVEL = pylogging.INFO
 LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
@@ -102,16 +97,33 @@ class TreeCache(AsyncDataset[T_co]):
         if not ledger.is_finished:
             raise RuntimeError(f"Cache at {cache_dir} is not finished.")
 
-        self._store = TreeStore.open(self._exemplar, self.cache_dir, mode="r", cache_metadata=False)
+        self._store = None
+        if not self.is_sharded:
+            self._store = TreeStore.open(self._exemplar, self.cache_dir, mode="r", cache_metadata=False)
 
     @property
     def store(self) -> TreeStore[T_co]:
+        if self._store is None:
+            raise RuntimeError(f"Cache at {self.cache_dir} is sharded and has no top-level TreeStore.")
         return self._store
 
+    @property
+    def is_sharded(self) -> bool:
+        return self.ledger.layout == CACHE_LAYOUT_SHARDED
+
+    def shard_path(self, shard_name: str) -> str:
+        if "://" in shard_name:
+            return shard_name
+        return os.path.join(self.cache_dir, shard_name)
+
     async def async_len(self) -> int:
+        if self.is_sharded:
+            return self.ledger.total_num_rows
         return len(self.store)
 
     def __len__(self):
+        if self.is_sharded:
+            return self.ledger.total_num_rows
         return len(self.store)
 
     def is_finite(self) -> bool:
@@ -167,6 +179,8 @@ class CacheLedger:
     is_finished: bool = False
     finished_shards: List[str] = dataclasses.field(default_factory=list)
     field_counts: Dict[str, int] = dataclasses.field(default_factory=dict)
+    field_counts_by_shard: Dict[str, Dict[str, int]] = dataclasses.field(default_factory=dict)
+    layout: str = CACHE_LAYOUT_CONSOLIDATED
     metadata: "CacheMetadata" = dataclasses.field(default_factory=lambda: CacheMetadata({}))
 
     @staticmethod
@@ -248,7 +262,7 @@ class SerialCacheWriter:
             is_finished=True,
             shard_rows={self._shard_name: len(self._tree_store)},
             finished_shards=[self._shard_name],
-            field_counts={},
+            field_counts=_field_counts_from_store(self._tree_store),
             metadata=self.metadata or CacheMetadata.empty(),
         )
 
@@ -370,7 +384,7 @@ def build_cache(
         ledger._serialize_and_commit(cache_dir)
         return ledger
 
-    temp_root = os.path.join(cache_dir, "__shards__")
+    temp_root = cache_dir
     shard_jobs = [{"shard_name": name, "index": idx} for idx, name in enumerate(shard_names)]
 
     def process_shard(job: dict):
@@ -399,7 +413,6 @@ def build_cache(
         exemplar=processor.output_exemplar,
         metadata=metadata,
     )
-    _safe_remove(temp_root)
     return ledger
 
 
@@ -458,22 +471,18 @@ def consolidate_shard_caches(
     output_path: str,
     exemplar,
     metadata: CacheMetadata | None = None,
-    copy_max_workers: int = 128,
 ) -> CacheLedger:
     """
-    Consolidate multiple shard caches into a single cache directory.
+    Consolidate multiple shard cache ledgers into a single sharded cache ledger.
 
     Args:
         shard_cache_paths: List of shard cache directories.
         output_path: Destination cache directory.
         exemplar: Output exemplar structure.
         metadata: CacheMetadata to use for the final ledger.
-        copy_max_workers: Maximum Zephyr fanout for the cache copy phase.
     """
     if metadata is None:
         metadata = CacheMetadata.empty()
-    if copy_max_workers < 1:
-        raise ValueError(f"copy_max_workers must be positive, got {copy_max_workers}")
 
     if not shard_cache_paths:
         ledger = CacheLedger(
@@ -482,28 +491,27 @@ def consolidate_shard_caches(
             is_finished=True,
             finished_shards=[],
             field_counts={},
+            field_counts_by_shard={},
+            layout=CACHE_LAYOUT_SHARDED,
             metadata=metadata,
         )
         ledger._serialize_and_commit(output_path)
         return ledger
 
-    logger.info(f"Consolidating {len(shard_cache_paths)} shard caches into {output_path}")
-
-    with _no_cache_read_context():
-        first_cache = TreeStore.open(exemplar, shard_cache_paths[0], mode="r", cache_metadata=True)
-        data_offset_tree = jax.tree.map(lambda x: 0, first_cache.tree)
-
-    shard_info: list[dict] = []
-    total_rows = 0
+    logger.info(f"Consolidating {len(shard_cache_paths)} shard cache ledgers into {output_path}")
 
     # Distributed: load ledger + read data_size for each shard in parallel.
     # Both operations are S3 I/O-bound; distributing across zephyr workers
     # avoids serializing thousands of S3 calls in the coordinator process.
     def _probe_shard(shard_path):
         ledger = CacheLedger.load(shard_path, metadata)
-        store = TreeStore.open(exemplar, shard_path, mode="r", cache_metadata=True)
-        data_sizes = jax.tree.map(lambda x: x.data_size, store.tree)
-        return (data_sizes, ledger)
+        if ledger.field_counts:
+            field_counts = ledger.field_counts
+        else:
+            with _no_cache_read_context():
+                store = TreeStore.open(exemplar, shard_path, mode="r", cache_metadata=True)
+                field_counts = _field_counts_from_store(store)
+        return (field_counts, ledger)
 
     probe_ctx = ZephyrContext(
         resources=ResourceConfig(ram="5g", cpu=2),
@@ -513,68 +521,35 @@ def consolidate_shard_caches(
     probe_results = probe_ctx.execute(
         Dataset.from_list(shard_cache_paths).map(_probe_shard),
     ).results
-    per_shard_sizes = [r[0] for r in probe_results]
+    per_shard_field_counts = [r[0] for r in probe_results]
     shard_ledgers = [r[1] for r in probe_results]
 
-    # Serial: accumulate row_offset and data_offset_tree (order-dependent)
-    for shard_path, ledger, this_offsets in zip(shard_cache_paths, shard_ledgers, per_shard_sizes):
-        shard_name = os.path.basename(shard_path)
-        shard_info.append(
-            {
-                "path": shard_path,
-                "shard_name": shard_name,
-                "row_offset": total_rows,
-                "data_offset_tree": copy.deepcopy(data_offset_tree),
-                "ledger": ledger,
-            }
-        )
-        total_rows += ledger.total_num_rows
-        data_offset_tree = jax.tree.map(operator.add, data_offset_tree, this_offsets)
-
-    TreeStore.open(exemplar, output_path, mode="w", cache_metadata=True)
-
-    def _copy_shard(info: dict):
-        asyncio.run(
-            _extend_cache_with_other_cache(
-                output_path, info["path"], exemplar, info["data_offset_tree"], info["row_offset"]
-            )
-        )
-
-    ctx = ZephyrContext(
-        resources=ResourceConfig(ram="10g", disk="16g"),
-        max_workers=min(copy_max_workers, len(shard_info)),
-        name="levanter-cache-copy",
-    )
-    ctx.execute(
-        Dataset.from_list(shard_info).map(_copy_shard),
-        verbose=False,
-    )
-
-    # Single shared transaction to coalesce metadata writes (see #4100, tensorstore#202)
-    asyncio.run(_consolidate_metadata(output_path, exemplar, shard_info))
-
-    final_ledger = _merge_ledgers(output_path, shard_cache_paths, shard_ledgers, metadata)
-    # as a final step, set the total num rows in the final cache
-    _expose_cache_rows(output_path, exemplar, final_ledger.total_num_rows)
-    return final_ledger
+    return _merge_ledgers(output_path, shard_cache_paths, shard_ledgers, per_shard_field_counts, metadata)
 
 
 def _merge_ledgers(
-    output_path: str, shard_cache_paths: list[str], shard_ledgers: list[CacheLedger], metadata: CacheMetadata
+    output_path: str,
+    shard_cache_paths: list[str],
+    shard_ledgers: list[CacheLedger],
+    per_shard_field_counts: list[dict[str, int]],
+    metadata: CacheMetadata,
 ) -> CacheLedger:
     final_ledger = CacheLedger(
         total_num_rows=0,
         shard_rows={},
         finished_shards=[],
         field_counts={},
+        field_counts_by_shard={},
+        layout=CACHE_LAYOUT_SHARDED,
         metadata=metadata,
     )
-    for shard_path, ledger in zip(shard_cache_paths, shard_ledgers):
-        shard_name = os.path.basename(shard_path)
+    for shard_path, ledger, field_counts in zip(shard_cache_paths, shard_ledgers, per_shard_field_counts, strict=True):
+        shard_name = _relative_shard_path(output_path, shard_path)
         final_ledger.shard_rows[shard_name] = ledger.total_num_rows
         final_ledger.finished_shards.append(shard_name)
         final_ledger.total_num_rows += ledger.total_num_rows
-        for field, count in ledger.field_counts.items():
+        final_ledger.field_counts_by_shard[shard_name] = field_counts
+        for field, count in field_counts.items():
             final_ledger.field_counts[field] = final_ledger.field_counts.get(field, 0) + count
 
     final_ledger.is_finished = True
@@ -630,14 +605,6 @@ def _distributed_build_cache(
             raise RuntimeError("Unexpected status received during distributed cache build.")
 
 
-def _safe_remove(path: str):
-    try:
-        if fsspec_exists(path):
-            fsspec_remove(path, recursive=True)
-    except Exception:  # noqa: BLE001
-        logger.exception(f"Failed to remove temporary cache path {path}")
-
-
 def _expose_cache_rows(cache_path: str, exemplar: T, num_rows: int) -> None:
     cache = TreeStore.open(exemplar, cache_path, mode="a", cache_metadata=False)
     futures = jax.tree.leaves(jax.tree.map(lambda x: x.offsets[0].write(num_rows), cache.tree))
@@ -645,104 +612,42 @@ def _expose_cache_rows(cache_path: str, exemplar: T, num_rows: int) -> None:
         future.result()
 
 
-async def _extend_cache_with_other_cache(
-    dest_path: str, source_path: str, exemplar: dict, data_offset_tree: PyTree[int], row_offset
-) -> int:
+def _relative_shard_path(output_path: str, shard_path: str) -> str:
+    if "://" in shard_path:
+        prefix = output_path.rstrip("/") + "/"
+        if shard_path.startswith(prefix):
+            return shard_path[len(prefix) :]
+        return shard_path
     try:
-        logger.info(f"Copying data from {source_path} to {dest_path}.")
-        with _no_cache_read_context():
-            dest = TreeStore.open(exemplar, dest_path, mode="a", cache_metadata=False)
-            source = TreeStore.open(exemplar, source_path, mode="r", cache_metadata=True)
-
-            source_num_rows = await source.async_len()
-
-            async def _copy_one_array(dest_array: JaggedArrayStore, source_array: JaggedArrayStore, data_offset: int):
-                data_size = source_array.data_size
-                data = source_array.data
-                MAX_ELEMS = 64 * 1024 * 1024
-                await _copy_in_batches(dest_array.data, data_offset, data, data_size, MAX_ELEMS)
-
-            futures = jax.tree.map(_copy_one_array, dest.tree, source.tree, data_offset_tree)
-            await asyncio.gather(*jax.tree.leaves(futures))
-            del dest, source
-        gc.collect()
-        logger.info(f"Finished copying data from {source_path} to {dest_path}.")
-        return source_num_rows
-    except Exception as e:  # noqa: BLE001
-        logger.exception(f"Failed to copy data from {source_path} to {dest_path}: {e}")
-        raise
+        return os.path.relpath(shard_path, output_path)
+    except ValueError:
+        return shard_path
 
 
-async def _copy_in_batches(dest_array, dest_offset, src_array, src_len, elems_per_batch):
-    start = 0
-    out_start = dest_offset
-    while start < src_len:
-        num_to_copy = min(elems_per_batch, src_len - start)
-        end = start + num_to_copy
-        out_end = out_start + num_to_copy
-
-        # Materialize into numpy to avoid holding TensorStore internal references
-        # across iterations. Direct ts-to-ts copy leaks ~14 MiB/shard (#4196).
-        chunk = await src_array[start:end].read()
-        await dest_array[out_start:out_end].write(chunk)
-        del chunk
-
-        start += num_to_copy
-        out_start += num_to_copy
+def _field_counts_from_store(store: TreeStore) -> dict[str, int]:
+    return _field_counts_from_data_sizes(jax.tree.map(lambda array: array.data_size, store.tree))
 
 
-async def _consolidate_metadata(dest_path: str, exemplar: dict, shard_infos: list[dict]) -> None:
-    """Copy metadata (offsets + shapes) from all shards into dest using a single shared transaction.
+def _field_counts_from_data_sizes(data_sizes) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for path, value in jtu.tree_leaves_with_path(data_sizes):
+        field = "/".join(_render_path_elem(part) for part in path)
+        counts[field] = int(value)
+    return counts
 
-    Replaces the old per-shard loop that committed a transaction per shard, causing
-    O(num_shards) read-modify-write cycles on the same zarr3 chunks (tensorstore#202).
-    """
-    dest = TreeStore.open(exemplar, dest_path, mode="a")
-    start = time.monotonic()
 
-    delay = 4
-    while True:
-        write_futures = []
-        try:
-            async with ts.Transaction() as txn:
-                for info in shard_infos:
-                    with _no_cache_read_context():
-                        source = TreeStore.open(exemplar, info["path"], mode="r", cache_metadata=True)
-                    source_num_rows = info["ledger"].total_num_rows
-                    row_offset = info["row_offset"]
-
-                    for dest_array, source_array, data_offset in zip(
-                        jax.tree.leaves(dest.tree),
-                        jax.tree.leaves(source.tree),
-                        jax.tree.leaves(info["data_offset_tree"]),
-                    ):
-                        if source_array.shapes is not None:
-                            assert dest_array.shapes is not None
-                            source_shapes = await source_array.shapes[:source_num_rows].read()
-                            out_end = row_offset + source_num_rows
-                            write_futures.append(
-                                dest_array.shapes.with_transaction(txn)[row_offset:out_end].write(source_shapes)
-                            )
-
-                        source_offsets = await source_array.offsets[1 : source_num_rows + 1].read()
-                        source_offsets = np.asarray(source_offsets) + data_offset
-                        out_end = 1 + row_offset + source_num_rows
-                        write_futures.append(
-                            dest_array.offsets.with_transaction(txn)[row_offset + 1 : out_end].write(source_offsets)
-                        )
-
-            await asyncio.gather(*write_futures)
-            elapsed = time.monotonic() - start
-            logger.info(f"Metadata consolidation complete: {len(shard_infos)} shards in {elapsed:.1f}s")
-            break
-        except ValueError as e:
-            if "Please reduce your request rate." not in str(e):
-                raise
-            logger.info(f"Rate limit exceeded during metadata consolidation. Retrying in {delay}s.")
-            await asyncio.sleep(delay)
-            delay *= 2
-            if delay > 120:
-                raise
+def _render_path_elem(path_elem) -> str:
+    match path_elem:
+        case jtu.DictKey(key):
+            return str(key)
+        case jtu.GetAttrKey(key):
+            return str(key)
+        case jtu.SequenceKey(i):
+            return str(i)
+        case jtu.FlattenedIndexKey(i):
+            return str(i)
+        case _:
+            return str(path_elem)
 
 
 def _sanitize_shard_name(name: str) -> str:
