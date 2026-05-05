@@ -37,7 +37,7 @@ iris job bug-report /user/job-name      # structured diagnostic dump
 
 - **`--memory` not `--ram`** — unrecognized flags silently pass through to the command string.
 - **`-e KEY VALUE`** uses two positional args. If `$VALUE` is unset, the parser eats the next token. Always quote: `-e KEY "${VALUE}"`.
-- **`--extra gpu`** installs CUDA jaxlib but does NOT request GPU hardware. Need both `--gpu H100x8 --extra gpu`.
+- **`--gpu` requests hardware; `--extra gpu` requests the Python dependency extra.** Need both for GPU JAX jobs.
 - **Use `--gpu` or `--tpu` to request accelerators, instead of `--region` or `--zone`.** Let Iris handle scaling group constraints. Use `--region` or `--zone` when you are trying to pin data to a particular location.
 - **`--reserve`** holds capacity for scheduling only — does not attach accelerator devices. Use `--tpu`/`--gpu` on the task that needs hardware.
 - **`executor_main` parent jobs** (e.g., canary ferries) submit GPU sub-tasks via Fray. The parent must be CPU-only (`--cpu 1 --memory 2g`), otherwise it hogs the GPU node and deadlocks. Memory at or above 4 GB requires `--enable-extra-resources` (see "Validator opt-in" below).
@@ -254,104 +254,9 @@ State dir: `gs://marin-us-central2/iris/<cluster>/state/` — contains `bundles/
 
 ## CoreWeave (GPU) Operations
 
-Use `lib/iris/examples/coreweave-*.yaml` for CoreWeave scale group configurations.
-
-### Connecting
-
-Preferred — let the CLI open the tunnel for you:
-
-```bash
-iris --cluster=coreweave-ci job logs /runner/my-job    # auto-tunnels
-iris cluster list                                      # see available cluster names
-```
-
-`--cluster=NAME` resolves to a config under `lib/iris/examples/` and establishes
-a `kubectl port-forward` to the controller service before each call, tearing it
-down on exit. The CLI prints `Establishing tunnel to controller... Tunnel
-ready: 127.0.0.1:<port> -> <svc>:10000`.
-
-Requires the `iris[controller]` extras (`duckdb`, `pyarrow`, `kubernetes`) in
-your venv — otherwise the CLI fails with `ImportError: Install
-iris[controller] to use CloudK8sService` before it can tunnel. If you see
-that error, `uv pip install 'marin-iris[controller]'` inside the venv.
-
-Fallback — manual port-forward (use if you don't have the extras or need to
-keep the tunnel up across many calls):
-
-```bash
-kubectl --kubeconfig ~/.kube/coreweave-iris \
-  port-forward -n <namespace> svc/<service_name> 10000:10000 &
-iris --controller-url=http://localhost:10000 ...
-```
-
-| Cluster name      | Namespace | Service                  | Config file          |
-|-------------------|-----------|--------------------------|----------------------|
-| `coreweave`       | `iris`    | `iris-controller-svc`    | `coreweave.yaml`     |
-| `coreweave-ci`    | `iris-ci` | `iris-ci-controller-svc` | `coreweave-ci.yaml`  |
-
-### KubernetesProvider vs Worker Daemons
-
-On CW, there are **no persistent worker daemons**. The controller dispatches tasks directly as K8s pods. `list-workers` returns empty. The `workers` SQL table is empty. Use `iris rpc controller get-kubernetes-cluster-status` for pod/node status.
-
-### kubectl Operations
-
-```bash
-kci get pods -n iris -l iris.managed=true     # task pods
-kci get nodepools                             # all nodepools (cluster-scoped)
-kci get events -n iris --sort-by=.lastTimestamp | tail -30
-kci logs -n iris deployment/iris-controller -f        # controller logs
-```
-
-(`kci` = `kubectl --kubeconfig ~/.kube/coreweave-iris`)
-
-### NodePool Management
-
-```bash
-# Check status (columns: TARGET, QUEUED, INPROGRESS, CURRENT, CAPACITY, QUOTA)
-kci get nodepools
-
-# Scale — do NOT use `kubectl scale --replicas`, that's the wrong field
-kci patch nodepool <name> --type=merge -p '{"spec":{"targetNodes":N}}'
-
-# Delete
-kci delete nodepool <name>
-```
-
-**Stuck deletion** (autoscaler fights deletion or node mid-delivery):
-
-```bash
-kci scale deployment iris-controller -n iris --replicas=0   # stop autoscaler
-kci patch nodepool <name> --type=merge -p '{"spec":{"autoscaling":false,"targetNodes":0}}'
-# If still stuck (mid-delivery): remove finalizer
-kci patch nodepool <name> --type=json -p '[{"op":"remove","path":"/metadata/finalizers"}]'
-kci delete nodepool <name>
-```
-
-### CW Teardown
-
-`iris cluster stop` deletes pods but **NodePools survive** (scale to zero via CW autoscaler). To avoid lingering GPU costs:
-
-```bash
-iris cluster stop
-kci delete nodepool -l iris-<label_prefix>-managed=true
-```
-
-### CW Gotchas
-
-- **NodePools survive `cluster stop`.** Delete explicitly to avoid lingering GPU costs.
-- **`list-workers` returns empty.** KubernetesProvider dispatches pods directly — no persistent workers. Use `iris rpc controller get-kubernetes-cluster-status`.
-- **`list-tasks` requires `job_id`.** Calling without it throws `ConnectError: job_id is required`.
-- **`cluster start` always rebuilds+pushes images.** Needs `docker login ghcr.io` with `write:packages` PAT.
-- **Konnectivity agent.** `kubectl port-forward` returns 500 until `konnectivity-agent` pods are running (~18-30s after node provisions).
-- **`kubectl scale --replicas` is wrong for NodePools.** Use `kci patch nodepool ... '{"spec":{"targetNodes":N}}'`.
-
-### GPU-canary pod stuck Pending, `NotTriggerScaleUp: 2 max node group size reached`
-
-- Check **account-wide** H100 contention, not just `iris-canary`: `kci get nodepools -A`. If `iris-ci-h100-8x` (or any other pool) is already holding the zone's H100 quota at `maxNodes=1`, the canary's `iris-canary-h100-8x` cannot scale up — CW account caps total H100 in US-WEST-04A.
-- Workaround: reuse the CI nodepool (point `coreweave-canary.yaml` `h100-8x` selector at `iris-iris-ci-managed=true` and coordinate with iris-ci) or scale `iris-ci-h100-8x` to 0 before the canary runs.
-- Root fix: CW support ticket to raise `gd-8xh100ib-i128` account quota ≥2 in US-WEST-04A.
-
----
+Always read [`docs/coreweave.md`](docs/coreweave.md) before operating a
+GPU/CoreWeave cluster. Use `lib/iris/examples/coreweave-*.yaml` for CoreWeave
+cluster configs.
 
 ## CI Workflows
 
@@ -368,11 +273,3 @@ gh workflow run "<workflow name>" -R marin-community/marin --ref main
 # View failed run
 gh run view <run-id> -R marin-community/marin --log-failed | tail -50
 ```
-
-## Cold-Start Timings
-
-| Resource | Time |
-|----------|------|
-| CW CPU node | ~14 min |
-| CW H100 bare-metal | ~20 min |
-| CW first training step (from zero) | ~25-30 min |
