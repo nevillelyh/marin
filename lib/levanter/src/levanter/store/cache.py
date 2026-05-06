@@ -28,6 +28,7 @@ from zephyr.writers import ThreadedBatchWriter, atomic_rename, batchify, ensure_
 
 from levanter.data.dataset import AsyncDataset
 from levanter.utils.jax_utils import broadcast_one_to_all
+from levanter.utils.thread_utils import blocking_wait
 
 from ..data._preprocessor import BatchProcessor, BatchResult, dict_from_record_batch
 from ..data.sharded_datasource import ShardedDataSource
@@ -99,6 +100,7 @@ class TreeCache(AsyncDataset[T_co]):
         self._shard_row_offsets: np.ndarray | None = None
         self._shard_field_stores: dict[tuple[str, str], Any] = {}
         self._shard_field_offsets: dict[str, np.ndarray] = {}
+        self._flat_field_offsets: dict[str, np.ndarray] = {}
 
         if not ledger.is_finished:
             raise RuntimeError(f"Cache at {cache_dir} is not finished.")
@@ -144,6 +146,13 @@ class TreeCache(AsyncDataset[T_co]):
                 return self.get_batch_sync(range(start, stop, step))
             return self.get_batch_sync([item])[0]
         return self.store[item]
+
+    def __iter__(self):
+        if self.is_sharded:
+            for index in range(len(self)):
+                yield self[index]
+            return
+        yield from self.store
 
     async def get_batch(self, indices: Sequence[int] | slice):
         if isinstance(indices, slice):
@@ -192,6 +201,16 @@ class TreeCache(AsyncDataset[T_co]):
             return self.ledger.total_num_rows
         return _tree_field(self.store.tree, field).num_rows
 
+    def jagged_array_tree(self):
+        if not self.is_sharded:
+            return self.store.tree
+
+        def field_store(path, _):
+            field = "/".join(_render_path_elem(part) for part in path)
+            return _ShardedJaggedArrayStore(self, field)
+
+        return jtu.tree_map_with_path(field_store, self._exemplar)
+
     async def get_flat_field_batch(self, field: str, offsets: Sequence[int], length: int) -> Sequence[np.ndarray]:
         if len(offsets) == 0:
             return []
@@ -221,14 +240,51 @@ class TreeCache(AsyncDataset[T_co]):
 
         counts = []
         for shard_name in self.ledger.finished_shards:
-            try:
-                counts.append(self.ledger.field_counts_by_shard[shard_name][field])
-            except KeyError as exc:
-                raise ValueError(f"Sharded cache ledger missing {field} count for shard {shard_name}") from exc
+            field_count = self.ledger.field_counts_by_shard.get(shard_name, {}).get(field)
+            if field_count is None:
+                if self.ledger.shard_rows[shard_name] == 0:
+                    field_count = 0
+                else:
+                    raise ValueError(f"Sharded cache ledger missing {field} count for shard {shard_name}")
+            counts.append(field_count)
 
         offsets = np.cumsum(np.array(counts, dtype=np.int64))
         self._shard_field_offsets[field] = offsets
         return self.ledger.finished_shards, offsets
+
+    def _ensure_flat_field_offsets(self, field: str) -> np.ndarray:
+        offsets = self._flat_field_offsets.get(field)
+        if offsets is not None:
+            return offsets
+
+        pieces = [np.array([self.ledger.total_num_rows], dtype=np.int64)]
+        data_offset = 0
+        for shard_name in self.ledger.finished_shards:
+            row_count = self.ledger.shard_rows[shard_name]
+            if row_count == 0:
+                continue
+
+            if field not in self.ledger.field_counts_by_shard.get(shard_name, {}):
+                raise ValueError(f"Sharded cache ledger missing {field} count for shard {shard_name}")
+
+            field_store = self._shard_field_store(shard_name, field)
+            shard_offsets = np.asarray(field_store.offsets[1 : row_count + 1].read().result(), dtype=np.int64)
+            pieces.append(shard_offsets + data_offset)
+            data_offset += int(shard_offsets[-1]) if len(shard_offsets) else 0
+
+        offsets = np.concatenate(pieces)
+        self._flat_field_offsets[field] = offsets
+        return offsets
+
+    async def _read_sharded_flat_field_slice(self, field: str, item: slice) -> np.ndarray:
+        start, stop, step = item.indices(self.flat_field_length(field))
+        if step != 1:
+            data = await self._get_sharded_flat_field(field, start, max(stop - start, 0))
+            return data[::step]
+        return await self._get_sharded_flat_field(field, start, max(stop - start, 0))
+
+    def _read_sharded_flat_field_slice_sync(self, field: str, item: slice) -> np.ndarray:
+        return blocking_wait(self._read_sharded_flat_field_slice(field, item))
 
     def _shard_store(self, shard_name: str) -> TreeStore[T_co]:
         store = self._shard_stores.get(shard_name)
@@ -310,6 +366,9 @@ class TreeCache(AsyncDataset[T_co]):
         return rows
 
     async def _get_sharded_flat_field(self, field: str, offset: int, length: int) -> np.ndarray:
+        if length == 0:
+            return np.array([], dtype=np.asarray(_tree_field(self._exemplar, field)).dtype)
+
         shard_names, shard_offsets = self._ensure_shard_field_offsets(field)
         remaining = length
         position = offset
@@ -446,6 +505,73 @@ def _field_exemplar(exemplar, field: str):
     if "/" not in field and isinstance(exemplar, Mapping):
         return {field: exemplar[field]}
     return exemplar
+
+
+class _ArrayRead:
+    def __init__(self, sync_reader, async_reader=None):
+        self._sync_reader = sync_reader
+        self._async_reader = async_reader
+
+    def read(self):
+        return _ArrayReadFuture(self._sync_reader, self._async_reader)
+
+
+class _ArrayReadFuture:
+    def __init__(self, sync_reader, async_reader=None):
+        self._sync_reader = sync_reader
+        self._async_reader = async_reader
+
+    def result(self):
+        return self._sync_reader()
+
+    def __await__(self):
+        async def read_async():
+            if self._async_reader is not None:
+                return await self._async_reader()
+            return self._sync_reader()
+
+        return read_async().__await__()
+
+
+class _ShardedJaggedArrayData:
+    def __init__(self, cache: TreeCache, field: str):
+        self._cache = cache
+        self._field = field
+
+    def __getitem__(self, item):
+        if not isinstance(item, slice):
+            item = slice(item, item + 1)
+        return _ArrayRead(
+            lambda: self._cache._read_sharded_flat_field_slice_sync(self._field, item),
+            lambda: self._cache._read_sharded_flat_field_slice(self._field, item),
+        )
+
+
+class _ShardedJaggedArrayOffsets:
+    def __init__(self, cache: TreeCache, field: str):
+        self._cache = cache
+        self._field = field
+
+    def __getitem__(self, item):
+        return _ArrayRead(lambda: self._cache._ensure_flat_field_offsets(self._field)[item])
+
+
+class _ShardedJaggedArrayStore:
+    def __init__(self, cache: TreeCache, field: str):
+        self._cache = cache
+        self._field = field
+        self.offsets = _ShardedJaggedArrayOffsets(cache, field)
+        self.data = _ShardedJaggedArrayData(cache, field)
+        self.shapes = None
+        self.item_rank = 1
+
+    @property
+    def num_rows(self) -> int:
+        return self._cache.flat_field_num_rows(self._field)
+
+    @property
+    def data_size(self) -> int:
+        return self._cache.flat_field_length(self._field)
 
 
 @dataclass_json

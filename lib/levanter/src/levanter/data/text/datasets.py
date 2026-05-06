@@ -352,7 +352,7 @@ class PackedTokenDataset(MappedAsyncDataset[tuple[dict, dict], GrugLmExample]):
         block_cross_document_attention: bool = True,
     ):
         self.packed: GreedyPrepackedDataset[dict] = GreedyPrepackedDataset(
-            cache.store.tree,
+            cache.jagged_array_tree(),
             Pos.size,
             max_segments_per_example=max_segments_per_example,
             slice_strategy=slice_strategy,
@@ -395,7 +395,7 @@ class ChatDataset(MappedAsyncDataset[tuple[ProcessedChatDict, ProcessedChatDict]
         block_cross_document_attention: bool = True,
     ):
         self.packed: GreedyPrepackedDataset[ProcessedChatDict] = GreedyPrepackedDataset(
-            cache.store.tree,
+            cache.jagged_array_tree(),
             Pos.size,
             max_segments_per_example=max_segments_per_example,
             slice_strategy=slice_strategy,
