@@ -312,7 +312,7 @@ class TreeCache(AsyncDataset[T_co]):
         shard_names, shard_offsets = self._ensure_shard_field_offsets(field)
         remaining = length
         position = offset
-        chunks = []
+        reads = []
 
         while remaining > 0:
             shard_index = int(np.searchsorted(shard_offsets, position, side="right"))
@@ -324,10 +324,11 @@ class TreeCache(AsyncDataset[T_co]):
             available = int(shard_offsets[shard_index] - position)
             take = min(remaining, available)
             field_store = self._shard_field_store(shard_names[shard_index], field)
-            chunks.append(await field_store.data[local_start : local_start + take].read())
+            reads.append(field_store.data[local_start : local_start + take].read())
             position += take
             remaining -= take
 
+        chunks = await asyncio.gather(*reads)
         if len(chunks) == 1:
             return chunks[0]
         return np.concatenate(chunks)
