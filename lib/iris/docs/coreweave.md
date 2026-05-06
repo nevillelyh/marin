@@ -211,6 +211,10 @@ report `NVIDIA GH200 480GB`.
 Before the full GPU canary, run one tiny direct JAX job for each row. It should
 prove `nvidia-smi`, GPU-backed JAX, and a tiny matmul.
 
+Marin's `gpu` extra installs the JAX CUDA 13 wheel stack from PyPI. CoreWeave
+GPU nodes must expose NVIDIA driver 580 or newer; `nvidia-smi` should report
+CUDA 13.x.
+
 ### KubernetesProvider Operations
 
 On CoreWeave, there are no persistent worker daemons. The controller dispatches
