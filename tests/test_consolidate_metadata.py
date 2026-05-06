@@ -1,7 +1,7 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for ledger-only shard cache consolidation."""
+"""Tests for shard cache consolidation metadata."""
 
 import os
 import tempfile
@@ -10,11 +10,13 @@ import numpy as np
 import pytest
 from levanter.data.text.datasets import TokenSeqDataset
 from levanter.store.cache import (
+    CACHE_LAYOUT_CONSOLIDATED,
     CACHE_LAYOUT_SHARDED,
     CacheLedger,
     TreeCache,
     _expose_cache_rows,
     _relative_shard_path,
+    consolidate_shard_cache_ledgers,
     consolidate_shard_caches,
 )
 from levanter.store.tree_store import TreeStore
@@ -45,7 +47,7 @@ def _build_shard_cache(shard_path: str, shard_index: int) -> None:
     ledger._serialize_and_commit(shard_path)
 
 
-def test_consolidate_shard_caches_writes_only_ledger():
+def test_consolidate_shard_cache_ledgers_writes_only_ledger():
     with tempfile.TemporaryDirectory(prefix="levanter-test-consolidate-") as tmpdir:
         shard_paths = []
         for i in range(NUM_SHARDS):
@@ -53,7 +55,7 @@ def test_consolidate_shard_caches_writes_only_ledger():
             _build_shard_cache(shard_path, i)
             shard_paths.append(shard_path)
 
-        ledger = consolidate_shard_caches(shard_paths, tmpdir, EXEMPLAR_FLAT)
+        ledger = consolidate_shard_cache_ledgers(shard_paths, tmpdir, EXEMPLAR_FLAT)
 
         assert ledger.layout == CACHE_LAYOUT_SHARDED
         assert ledger.total_num_rows == NUM_SHARDS * ROWS_PER_SHARD
@@ -62,6 +64,30 @@ def test_consolidate_shard_caches_writes_only_ledger():
 
         with pytest.raises(FileNotFoundError):
             TreeStore.open(EXEMPLAR_FLAT, tmpdir, mode="r", cache_metadata=True)
+
+
+def test_consolidate_shard_caches_writes_materialized_tree_store():
+    with tempfile.TemporaryDirectory(prefix="levanter-test-consolidate-materialized-") as tmpdir:
+        output_path = os.path.join(tmpdir, "output")
+        shard_paths = []
+        for i in range(NUM_SHARDS):
+            shard_path = os.path.join(tmpdir, f"part-{i:05d}")
+            _build_shard_cache(shard_path, i)
+            shard_paths.append(shard_path)
+
+        ledger = consolidate_shard_caches(shard_paths, output_path, EXEMPLAR_FLAT)
+
+        assert ledger.layout == CACHE_LAYOUT_CONSOLIDATED
+        assert ledger.total_num_rows == NUM_SHARDS * ROWS_PER_SHARD
+        assert ledger.field_counts == {"input_ids": NUM_SHARDS * ROWS_PER_SHARD * ROW_WIDTH}
+
+        cache = TreeCache.load(output_path, EXEMPLAR_FLAT)
+        assert cache.store.tree["input_ids"].data_size == NUM_SHARDS * ROWS_PER_SHARD * ROW_WIDTH
+        np.testing.assert_array_equal(cache[0]["input_ids"], np.arange(ROW_WIDTH, dtype=np.int32))
+        np.testing.assert_array_equal(
+            cache[ROWS_PER_SHARD]["input_ids"],
+            np.arange(ROW_WIDTH, dtype=np.int32) + 100,
+        )
 
 
 def test_relative_shard_path_keeps_external_local_paths_absolute():
@@ -85,7 +111,7 @@ async def test_consolidate_external_shards_uses_absolute_paths():
             _build_shard_cache(shard_path, i)
             shard_paths.append(shard_path)
 
-        ledger = consolidate_shard_caches(shard_paths, output_path, EXEMPLAR_FLAT)
+        ledger = consolidate_shard_cache_ledgers(shard_paths, output_path, EXEMPLAR_FLAT)
 
         assert ledger.finished_shards == shard_paths
         cache = TreeCache.load(output_path, EXEMPLAR_FLAT)
@@ -162,7 +188,7 @@ async def test_token_seq_dataset_reads_sharded_cache():
             for row_index in range(ROWS_PER_SHARD):
                 all_tokens.extend(np.arange(ROW_WIDTH, dtype=np.int32) + i * 100 + row_index * 10)
 
-        consolidate_shard_caches(shard_paths, tmpdir, EXEMPLAR_FLAT)
+        consolidate_shard_cache_ledgers(shard_paths, tmpdir, EXEMPLAR_FLAT)
         cache = TreeCache.load(tmpdir, EXEMPLAR_FLAT)
         dataset = TokenSeqDataset(cache, SEQ_LEN)
 
@@ -184,7 +210,7 @@ async def test_tree_cache_get_batch_reads_sharded_rows():
             _build_shard_cache(shard_path, i)
             shard_paths.append(shard_path)
 
-        consolidate_shard_caches(shard_paths, tmpdir, EXEMPLAR_FLAT)
+        consolidate_shard_cache_ledgers(shard_paths, tmpdir, EXEMPLAR_FLAT)
         cache = TreeCache.load(tmpdir, EXEMPLAR_FLAT)
 
         batch = await cache.get_batch([0, ROWS_PER_SHARD, NUM_SHARDS * ROWS_PER_SHARD - 1])
@@ -206,7 +232,7 @@ async def test_tree_cache_get_batch_slice_uses_python_slice_semantics():
             _build_shard_cache(shard_path, i)
             shard_paths.append(shard_path)
 
-        consolidate_shard_caches(shard_paths, tmpdir, EXEMPLAR_FLAT)
+        consolidate_shard_cache_ledgers(shard_paths, tmpdir, EXEMPLAR_FLAT)
         cache = TreeCache.load(tmpdir, EXEMPLAR_FLAT)
 
         assert await cache.get_batch(slice(0, 0)) == []
@@ -222,7 +248,7 @@ def test_tree_cache_get_batch_sync_slice_uses_python_slice_semantics():
             _build_shard_cache(shard_path, i)
             shard_paths.append(shard_path)
 
-        consolidate_shard_caches(shard_paths, tmpdir, EXEMPLAR_FLAT)
+        consolidate_shard_cache_ledgers(shard_paths, tmpdir, EXEMPLAR_FLAT)
         cache = TreeCache.load(tmpdir, EXEMPLAR_FLAT)
 
         assert cache.get_batch_sync(slice(0, 0)) == []

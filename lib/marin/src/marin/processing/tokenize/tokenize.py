@@ -30,7 +30,7 @@ from levanter.data.text import (
     UrlDatasetSourceConfig,
     preprocessor_for_format,
 )
-from levanter.store.cache import consolidate_shard_caches, write_levanter_cache
+from levanter.store.cache import consolidate_shard_cache_ledgers, write_levanter_cache
 from levanter.tokenizers import MarinTokenizer, TokenizerBackend, load_tokenizer
 from rigging.filesystem import open_url, url_to_fs
 from rigging.log_setup import configure_logging
@@ -490,7 +490,7 @@ def tokenize(config: TokenizeConfigBase):
 
         consolidate_start = time.monotonic()
         logger.info(f"Consolidating {len(shard_paths)} shards into {prefix}")
-        ledger = consolidate_shard_caches(
+        ledger = consolidate_shard_cache_ledgers(
             shard_cache_paths=shard_paths,
             output_path=prefix,
             exemplar=exemplar,
