@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -22,17 +24,18 @@ from pathlib import Path
 from threading import Lock
 
 import duckdb
+import fsspec.core
 import pyarrow as pa
 import pyarrow.ipc as paipc
 
 from finelog.store.catalog import Catalog, NamespaceStats
+from finelog.store.compactor import CompactionConfig
 from finelog.store.layout_migration import LOG_NAMESPACE_DIR
 from finelog.store.log_namespace import (
     LOG_REGISTERED_SCHEMA,
     DiskLogNamespace,
     LogNamespaceProtocol,
     MemoryLogNamespace,
-    _is_tmp_path,
 )
 from finelog.store.rwlock import RWLock
 from finelog.store.schema import (
@@ -57,17 +60,6 @@ LOG_NAMESPACE_NAME = "log"
 
 SEGMENT_TARGET_BYTES = 100 * 1024 * 1024
 DEFAULT_FLUSH_INTERVAL_SEC = 60.0
-DEFAULT_COMPACTION_INTERVAL_SEC = 600.0
-
-# Trigger compaction when this many tmp segments accumulate even before the
-# time-based interval fires. Bounds per-read fanout under high ingest.
-DEFAULT_MAX_TMP_SEGMENTS_BEFORE_COMPACT = 10
-
-# The read path has no remote fallback yet: once a parquet is GC'd locally,
-# its rows are unreachable via FetchLogs even though they're durable on GCS.
-# Sized for ~2 weeks of the production marin cluster's ingest (~6-7 GB/day).
-DEFAULT_MAX_LOCAL_SEGMENTS = 1000
-DEFAULT_MAX_LOCAL_BYTES = 100 * 1024**3
 
 # 4GB was the previous default but in practice finelog's read pattern
 # rarely needs more than tens of MB; the high cap mostly let mimalloc/DuckDB
@@ -82,6 +74,12 @@ _DEFAULT_DUCKDB_THREADS = "4"
 # parent doesn't trip Linux's overcommit heuristic when forking subprocesses.
 EMBEDDED_DUCKDB_MEMORY_LIMIT = "128MB"
 EMBEDDED_DUCKDB_THREADS = "2"
+
+# Streaming chunk size for src->dst copy. 4 MiB keeps RAM usage flat regardless
+# of segment size while still amortizing per-write overhead on GCS.
+_COPY_CHUNK_BYTES = 4 * 1024 * 1024
+# How long ``close()`` waits for the copy worker to drain before forcing exit.
+_COPY_DRAIN_TIMEOUT_SEC = 10.0
 
 
 # Namespace names: lowercase ASCII alphanumerics + ._-, starting with a
@@ -101,26 +99,23 @@ def _next_cursor_id() -> int:
         return _cursor_counter
 
 
-class _ConnectionPool:
-    """Two DuckDB connections: one shared for reads, one for compaction.
+class ConnectionPool:
+    """Single DuckDB read connection shared across all read paths.
 
-    Reads share a single connection with ``enable_object_cache`` so parquet
-    footer / row-group stats are cached across queries. Compaction runs on
-    a separate connection so its sort cost cannot starve readers (a shared
-    connection wedged the controller under concurrent tail reads).
+    ``enable_object_cache`` keeps parquet footer / row-group stats hot
+    across queries. Compaction does not share this connection — each
+    namespace owns its own DuckDB conn for compaction COPYs so concurrent
+    namespaces can't collide on session state.
     """
 
     def __init__(
         self,
         memory_limit: str = _DEFAULT_DUCKDB_MEMORY_LIMIT,
-        compaction_memory_limit: str = _DEFAULT_DUCKDB_COMPACTION_MEMORY_LIMIT,
         threads: str = _DEFAULT_DUCKDB_THREADS,
     ):
-        self._conn = duckdb.connect(config={"memory_limit": memory_limit, "threads": threads})
+        config = {"memory_limit": memory_limit, "threads": threads}
+        self._conn = duckdb.connect(config=config)
         self._conn.execute("SET enable_object_cache=true")
-        self._compaction_conn = duckdb.connect(
-            config={"memory_limit": compaction_memory_limit, "threads": threads},
-        )
         # Serializes DDL on the shared read connection. ``query()`` issues
         # ``CREATE OR REPLACE VIEW {namespace}`` for every registered
         # namespace, and concurrent calls would collide on the same view
@@ -145,13 +140,103 @@ class _ConnectionPool:
                 cursor.unregister(name)
             cursor.close()
 
-    @property
-    def compaction_conn(self) -> duckdb.DuckDBPyConnection:
-        return self._compaction_conn
-
     def close(self) -> None:
         self._conn.close()
-        self._compaction_conn.close()
+
+
+class CopyWorker:
+    """Polling background uploader for L>=1 catalog segments.
+
+    One worker per :class:`DuckDBLogStore`. Walks the catalog every
+    ``_POLL_INTERVAL_SEC`` (or sooner when woken) for ``level >= 1 AND
+    copied_at_ms IS NULL`` rows, streams each parquet to remote storage,
+    and stamps the row on success. Per-segment RAM footprint is bounded
+    by ``_COPY_CHUNK_BYTES``.
+
+    Decoupling from compaction means the copy policy is "anything
+    promoted to L1+ that doesn't yet have a remote copy" — the planner
+    doesn't know or care about uploads.
+    """
+
+    _POLL_INTERVAL_SEC = 5.0
+
+    def __init__(self, store: DuckDBLogStore, remote_log_dir: str) -> None:
+        self._store = store
+        self._remote_log_dir = remote_log_dir
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="finelog_copy", daemon=True)
+        self._thread.start()
+
+    def wake(self) -> None:
+        """Hint that new L>=1 segments may exist; speeds up the next pass."""
+        self._wake.set()
+
+    def wait_drained(self, timeout: float) -> bool:
+        """Block until the catalog has no L>=1 rows missing ``copied_at_ms``.
+
+        Returns True on drain, False on timeout.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.wake()
+            with self._store._insertion_lock:
+                if not self._store._catalog.list_pending_copies():
+                    return True
+            time.sleep(0.05)
+        with self._store._insertion_lock:
+            return not self._store._catalog.list_pending_copies()
+
+    def close(self, timeout: float = _COPY_DRAIN_TIMEOUT_SEC) -> None:
+        self.wait_drained(timeout)
+        self._stop.set()
+        self._wake.set()
+        self._thread.join(timeout=timeout)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                with self._store._insertion_lock:
+                    pending = self._store._catalog.list_pending_copies()
+            except Exception:
+                logger.warning("copy poll failed", exc_info=True)
+                pending = []
+            for row in pending:
+                if self._stop.is_set():
+                    break
+                completed_ms = self._upload(row.namespace, Path(row.path))
+                if completed_ms is not None:
+                    self._store._mark_copied(row.namespace, row.path, completed_ms)
+            self._wake.wait(timeout=self._POLL_INTERVAL_SEC)
+            self._wake.clear()
+
+    def _upload(self, namespace: str, local_path: Path) -> int | None:
+        """Stream ``local_path`` to the remote path. Returns completion ms
+        on success, ``None`` on failure (the catalog row stays unstamped
+        and the next poll retries)."""
+        remote_path = f"{self._remote_log_dir.rstrip('/')}/{namespace}/{local_path.name}"
+        upload_start = time.monotonic()
+        try:
+            with (
+                fsspec.core.open(str(local_path), "rb") as f_src,
+                fsspec.core.open(remote_path, "wb") as f_dst,
+            ):
+                shutil.copyfileobj(f_src, f_dst, length=_COPY_CHUNK_BYTES)
+        except Exception:
+            logger.warning("Failed to copy %s to %s", local_path, remote_path, exc_info=True)
+            return None
+        try:
+            size = local_path.stat().st_size
+        except OSError:
+            size = -1
+        logger.info(
+            "Copied %s to %s: bytes=%d elapsed_ms=%d",
+            local_path.name,
+            remote_path,
+            size,
+            int((time.monotonic() - upload_start) * 1000),
+        )
+        return int(time.time() * 1000)
 
 
 def _validate_namespace_name(name: str, data_dir: Path | None) -> Path | None:
@@ -183,7 +268,7 @@ class DuckDBLogStore:
 
     Layout: per-namespace under ``{log_dir}/{name}/``; schema sidecar at
     ``{log_dir}/_finelog_registry.duckdb``. ``log_dir=None`` selects
-    in-memory mode (no segmentation, no GCS offload, state vanishes on close).
+    in-memory mode (no segmentation, no remote copy, state vanishes on close).
     """
 
     def __init__(
@@ -191,11 +276,8 @@ class DuckDBLogStore:
         log_dir: Path | None = None,
         *,
         remote_log_dir: str = "",
-        max_local_segments: int = DEFAULT_MAX_LOCAL_SEGMENTS,
-        max_local_bytes: int = DEFAULT_MAX_LOCAL_BYTES,
         flush_interval_sec: float = DEFAULT_FLUSH_INTERVAL_SEC,
-        compaction_interval_sec: float = DEFAULT_COMPACTION_INTERVAL_SEC,
-        max_tmp_segments_before_compact: int = DEFAULT_MAX_TMP_SEGMENTS_BEFORE_COMPACT,
+        compaction_config: CompactionConfig = CompactionConfig(),
         segment_target_bytes: int = SEGMENT_TARGET_BYTES,
         duckdb_memory_limit: str = _DEFAULT_DUCKDB_MEMORY_LIMIT,
         duckdb_compaction_memory_limit: str = _DEFAULT_DUCKDB_COMPACTION_MEMORY_LIMIT,
@@ -207,32 +289,30 @@ class DuckDBLogStore:
 
         self._insertion_lock = Lock()
         self._query_visibility_lock = RWLock()
-        self._pool = _ConnectionPool(
-            memory_limit=duckdb_memory_limit,
-            compaction_memory_limit=duckdb_compaction_memory_limit,
-            threads=duckdb_threads,
-        )
+        self._pool = ConnectionPool(memory_limit=duckdb_memory_limit, threads=duckdb_threads)
         self._catalog = Catalog(self._data_dir)
 
-        # Global storage caps. Eviction picks the oldest sealed segment
-        # across all namespaces (oldest-first by ``min_seq`` with namespace
-        # registration time as the tiebreak). Per-namespace quotas are
-        # deferred until evidence of starvation forces them.
-        self._max_local_segments = max_local_segments
-        self._max_local_bytes = max_local_bytes
-        self._namespace_registered_at: dict[str, int] = {}
+        # Polling uploader: independent of compaction. Walks the catalog
+        # for L>=1 segments without ``copied_at_ms`` and uploads them.
+        # Only spun up when remote storage is configured.
+        self._copy_worker: CopyWorker | None = (
+            CopyWorker(self, remote_log_dir) if remote_log_dir and self._data_dir is not None else None
+        )
 
+        self._namespace_registered_at: dict[str, int] = {}
         self._namespaces: dict[str, LogNamespaceProtocol] = {}
 
-        # Disk-only kwargs; ignored by memory namespaces.
+        # Disk-only kwargs; ignored by memory namespaces. ``duckdb_memory_limit``
+        # in this dict feeds the per-namespace compaction connection in
+        # ``DiskLogNamespace``; we route the dedicated compaction cap here so
+        # tier-merges don't share the read pool's tighter ceiling.
         self._disk_namespace_kwargs = dict(
-            remote_log_dir=remote_log_dir,
+            copy_wake=self._wake_copier,
             flush_interval_sec=flush_interval_sec,
-            compaction_interval_sec=compaction_interval_sec,
-            max_tmp_segments_before_compact=max_tmp_segments_before_compact,
+            compaction_config=compaction_config,
             segment_target_bytes=segment_target_bytes,
-            compaction_conn=self._pool.compaction_conn,
-            evict_hook=self._evict_globally,
+            duckdb_memory_limit=duckdb_compaction_memory_limit,
+            duckdb_threads=duckdb_threads,
         )
 
         self._rehydrate_from_registry()
@@ -347,7 +427,7 @@ class DuckDBLogStore:
             return ns.schema
 
     def memory_summary(self) -> dict[str, int]:
-        """Aggregate ram_bytes/chunk_count across namespaces, for diagnostics.
+        """Aggregate ram_bytes / chunk_count across namespaces, for diagnostics.
 
         Used by the periodic pool-diagnostics logger in the standalone server.
         ``MemoryLogNamespace`` reports zeros (no in-RAM segmented buffer).
@@ -484,63 +564,17 @@ class DuckDBLogStore:
         finally:
             self._query_visibility_lock.write_release()
 
-    def _evict_globally(self) -> None:
-        """Evict the globally-oldest sealed segments until under the caps.
+    def _mark_copied(self, namespace: str, path: str, copied_at_ms: int) -> None:
+        """Worker-thread entry point for stamping the catalog after upload.
 
-        Tmp (in-flight) segments are excluded from both the count and the
-        candidate list: counting them would falsely flag a namespace with
-        many tmp segments as over-cap and evict its sealed data prematurely.
+        Eviction filters on ``copied_at_ms IS NOT NULL`` so a freshly
+        compacted segment becomes evictable only after the remote copy
+        is durable.
         """
-        candidates: list[tuple[int, int, str, int, str]] = []
-        with self._insertion_lock:
-            total_segments = 0
-            total_bytes = 0
-            for ns_name, ns in self._namespaces.items():
-                reg_order = self._namespace_registered_at.get(ns_name, 0)
-                for seg in ns.all_segments_unlocked():
-                    if _is_tmp_path(seg.path):
-                        continue
-                    total_segments += 1
-                    total_bytes += seg.size_bytes
-                    candidates.append((seg.min_seq, reg_order, ns_name, seg.size_bytes, seg.path))
-
-        if total_segments <= self._max_local_segments and total_bytes <= self._max_local_bytes:
+        ns = self._namespaces.get(namespace)
+        if ns is None:
             return
-
-        # Smallest min_seq first; tiebreak on registration order then name.
-        candidates.sort(key=lambda t: (t[0], t[1], t[2]))
-
-        evictions: list[tuple[str, str, int]] = []
-        remaining_segments = total_segments
-        remaining_bytes = total_bytes
-        for _min_seq, _reg, ns_name, size, path in candidates:
-            if remaining_segments <= self._max_local_segments and remaining_bytes <= self._max_local_bytes:
-                break
-            evictions.append((ns_name, path, size))
-            remaining_segments -= 1
-            remaining_bytes -= size
-
-        if not evictions:
-            return
-
-        self._query_visibility_lock.write_acquire()
-        try:
-            freed_bytes = 0
-            for ns_name, path, _size in evictions:
-                ns = self._namespaces.get(ns_name)
-                if ns is None:
-                    continue
-                freed_bytes += ns.evict_segment(path)
-        finally:
-            self._query_visibility_lock.write_release()
-
-        logger.info(
-            "Globally evicted %d segment(s), freed=%d bytes, remaining=%d segments / %d bytes",
-            len(evictions),
-            freed_bytes,
-            remaining_segments,
-            remaining_bytes,
-        )
+        ns.mark_copied(path, copied_at_ms)
 
     def append(self, key: str, entries: list) -> None:
         if not entries:
@@ -583,8 +617,21 @@ class DuckDBLogStore:
     def close(self) -> None:
         for ns in self._namespaces.values():
             ns.close()
+        if self._copy_worker is not None:
+            self._copy_worker.close()
         self._pool.close()
         self._catalog.close()
+
+    def _wake_copier(self) -> None:
+        """Hint the copy worker that fresh L>=1 segments may exist."""
+        if self._copy_worker is not None:
+            self._copy_worker.wake()
+
+    def _wait_for_copies(self, timeout: float = _COPY_DRAIN_TIMEOUT_SEC) -> bool:
+        """Block until the catalog has no pending L>=1 copies. Test/shutdown hook."""
+        if self._copy_worker is None:
+            return True
+        return self._copy_worker.wait_drained(timeout)
 
     # Test hooks below; forward to the registered "log" namespace.
 
@@ -609,7 +656,7 @@ class DuckDBLogStore:
                 ns._flush_generation_cond.wait(timeout=remaining)
 
     def _force_compaction(self) -> None:
-        self._log_namespace._compaction_step()
+        self._log_namespace._force_compact_l0()
 
     def _wait_for_compaction(self, timeout: float = 10.0) -> None:
         ns = self._log_namespace
