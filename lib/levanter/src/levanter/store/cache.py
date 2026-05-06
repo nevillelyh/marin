@@ -12,7 +12,7 @@ import threading
 import time
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Protocol, Sequence, TypeVar, Union, cast
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple, TypeVar, Union, cast
 
 import deepdiff
 import jax
@@ -100,11 +100,11 @@ class TreeCache(AsyncDataset[T_co]):
         self.cache_dir = cache_dir
         self.ledger = ledger
         self._exemplar = exemplar
-        self._shard_stores: dict[str, TreeStore[T_co]] = {}
-        self._shard_row_offsets: np.ndarray | None = None
-        self._shard_field_stores: dict[tuple[str, str], Any] = {}
-        self._shard_field_offsets: dict[str, np.ndarray] = {}
-        self._flat_field_offsets: dict[str, np.ndarray] = {}
+        self._shard_stores: Dict[str, TreeStore[T_co]] = {}
+        self._shard_row_offsets: Optional[np.ndarray] = None
+        self._shard_field_stores: Dict[Tuple[str, str], Any] = {}
+        self._shard_field_offsets: Dict[str, np.ndarray] = {}
+        self._flat_field_offsets: Dict[str, np.ndarray] = {}
 
         if not ledger.is_finished:
             raise RuntimeError(f"Cache at {cache_dir} is not finished.")
@@ -165,7 +165,7 @@ class TreeCache(AsyncDataset[T_co]):
     async def get_flat_field_batch(self, field: str, offsets: Sequence[int], length: int) -> Sequence[np.ndarray]:
         return await self._reader.get_flat_field_batch(field, offsets, length)
 
-    def _ensure_shard_row_offsets(self) -> tuple[list[str], np.ndarray]:
+    def _ensure_shard_row_offsets(self) -> Tuple[List[str], np.ndarray]:
         if self._shard_row_offsets is not None:
             return self.ledger.finished_shards, self._shard_row_offsets
 
@@ -173,7 +173,7 @@ class TreeCache(AsyncDataset[T_co]):
         self._shard_row_offsets = np.cumsum(np.array(counts, dtype=np.int64))
         return self.ledger.finished_shards, self._shard_row_offsets
 
-    def _ensure_shard_field_offsets(self, field: str) -> tuple[list[str], np.ndarray]:
+    def _ensure_shard_field_offsets(self, field: str) -> Tuple[List[str], np.ndarray]:
         offsets = self._shard_field_offsets.get(field)
         if offsets is not None:
             return self.ledger.finished_shards, offsets
@@ -247,12 +247,12 @@ class TreeCache(AsyncDataset[T_co]):
             self._shard_field_stores[key] = store
         return store
 
-    async def _get_sharded_batch(self, indices: Sequence[int]) -> list[T_co]:
+    async def _get_sharded_batch(self, indices: Sequence[int]) -> List[T_co]:
         if len(indices) == 0:
             return []
 
         shard_names, shard_offsets = self._ensure_shard_row_offsets()
-        shard_batches: dict[int, list[tuple[int, int]]] = {}
+        shard_batches: Dict[int, List[Tuple[int, int]]] = {}
         for output_index, index in enumerate(indices):
             index = int(index)
             if index < 0 or index >= self.ledger.total_num_rows:
@@ -262,9 +262,9 @@ class TreeCache(AsyncDataset[T_co]):
             shard_start = int(shard_offsets[shard_index - 1]) if shard_index > 0 else 0
             shard_batches.setdefault(shard_index, []).append((output_index, index - shard_start))
 
-        output: list[T_co | None] = [None] * len(indices)
+        output: List[Optional[T_co]] = [None] * len(indices)
 
-        async def read_shard(shard_index: int, batch: list[tuple[int, int]]) -> None:
+        async def read_shard(shard_index: int, batch: List[Tuple[int, int]]) -> None:
             local_indices = [local_index for _, local_index in batch]
             shard_batch = await self._shard_store(shard_names[shard_index]).get_batch(local_indices)
             for (output_index, _), row in zip(batch, shard_batch, strict=True):
@@ -277,12 +277,12 @@ class TreeCache(AsyncDataset[T_co]):
             rows.append(row)
         return rows
 
-    def _get_sharded_batch_sync(self, indices: Sequence[int]) -> list[T_co]:
+    def _get_sharded_batch_sync(self, indices: Sequence[int]) -> List[T_co]:
         if len(indices) == 0:
             return []
 
         shard_names, shard_offsets = self._ensure_shard_row_offsets()
-        shard_batches: dict[int, list[tuple[int, int]]] = {}
+        shard_batches: Dict[int, List[Tuple[int, int]]] = {}
         for output_index, index in enumerate(indices):
             index = int(index)
             if index < 0 or index >= self.ledger.total_num_rows:
@@ -292,7 +292,7 @@ class TreeCache(AsyncDataset[T_co]):
             shard_start = int(shard_offsets[shard_index - 1]) if shard_index > 0 else 0
             shard_batches.setdefault(shard_index, []).append((output_index, index - shard_start))
 
-        output: list[T_co | None] = [None] * len(indices)
+        output: List[Optional[T_co]] = [None] * len(indices)
         for shard_index, batch in shard_batches.items():
             local_indices = [local_index for _, local_index in batch]
             shard_batch = self._shard_store(shard_names[shard_index]).get_batch_sync(local_indices)
@@ -365,11 +365,11 @@ class _TreeCacheReader(Protocol[T_co]):
 
     def __len__(self) -> int: ...
 
-    def __getitem__(self, item) -> T_co | Sequence[T_co]: ...
+    def __getitem__(self, item) -> Union[T_co, Sequence[T_co]]: ...
 
     def __iter__(self) -> Iterator[T_co]: ...
 
-    async def get_batch(self, indices: Sequence[int] | slice) -> Sequence[T_co]: ...
+    async def get_batch(self, indices: Union[Sequence[int], slice]) -> Sequence[T_co]: ...
 
     def get_batch_sync(self, indices_or_slice, *, timeout: Optional[float] = None) -> Sequence[T_co]: ...
 
@@ -398,14 +398,14 @@ class _MaterializedTreeCacheReader:
     def __len__(self) -> int:
         return len(self._store)
 
-    def __getitem__(self, item) -> T_co | Sequence[T_co]:
+    def __getitem__(self, item) -> Union[T_co, Sequence[T_co]]:
         return self._store[item]
 
     def __iter__(self) -> Iterator[T_co]:
         for row in self._store:
             yield cast(T_co, row)
 
-    async def get_batch(self, indices: Sequence[int] | slice) -> Sequence[T_co]:
+    async def get_batch(self, indices: Union[Sequence[int], slice]) -> Sequence[T_co]:
         if isinstance(indices, slice):
             start, stop, step = indices.indices(len(self))
             indices = range(start, stop, step)
@@ -453,7 +453,7 @@ class _ShardedTreeCacheReader:
     def __len__(self) -> int:
         return self._cache.ledger.total_num_rows
 
-    def __getitem__(self, item) -> T_co | Sequence[T_co]:
+    def __getitem__(self, item) -> Union[T_co, Sequence[T_co]]:
         if isinstance(item, slice):
             start, stop, step = item.indices(len(self))
             return self.get_batch_sync(range(start, stop, step))
@@ -463,7 +463,7 @@ class _ShardedTreeCacheReader:
         for index in range(len(self)):
             yield cast(T_co, self.get_batch_sync([index])[0])
 
-    async def get_batch(self, indices: Sequence[int] | slice) -> Sequence[T_co]:
+    async def get_batch(self, indices: Union[Sequence[int], slice]) -> Sequence[T_co]:
         if isinstance(indices, slice):
             start, stop, step = indices.indices(len(self))
             indices = range(start, stop, step)
@@ -1024,10 +1024,10 @@ def consolidate_shard_caches(
 
 
 def consolidate_shard_cache_ledgers(
-    shard_cache_paths: list[str],
+    shard_cache_paths: List[str],
     output_path: str,
     exemplar,
-    metadata: CacheMetadata | None = None,
+    metadata: Optional[CacheMetadata] = None,
 ) -> CacheLedger:
     """
     Consolidate multiple shard cache ledgers into one sharded cache ledger.
@@ -1083,9 +1083,9 @@ def consolidate_shard_cache_ledgers(
 
 def _merge_materialized_ledgers(
     output_path: str,
-    shard_cache_paths: list[str],
-    shard_ledgers: list[CacheLedger],
-    per_shard_field_counts: list[dict[str, int]],
+    shard_cache_paths: List[str],
+    shard_ledgers: List[CacheLedger],
+    per_shard_field_counts: List[Dict[str, int]],
     metadata: CacheMetadata,
 ) -> CacheLedger:
     final_ledger = CacheLedger(
@@ -1110,9 +1110,9 @@ def _merge_materialized_ledgers(
 
 def _merge_sharded_ledgers(
     output_path: str,
-    shard_cache_paths: list[str],
-    shard_ledgers: list[CacheLedger],
-    per_shard_field_counts: list[dict[str, int]],
+    shard_cache_paths: List[str],
+    shard_ledgers: List[CacheLedger],
+    per_shard_field_counts: List[Dict[str, int]],
     metadata: CacheMetadata,
 ) -> CacheLedger:
     final_ledger = CacheLedger(
@@ -1306,12 +1306,12 @@ def _relative_shard_path(output_path: str, shard_path: str) -> str:
     return relative_path
 
 
-def _field_counts_from_store(store: TreeStore) -> dict[str, int]:
+def _field_counts_from_store(store: TreeStore) -> Dict[str, int]:
     return _field_counts_from_data_sizes(jax.tree.map(lambda array: array.data_size, store.tree))
 
 
-def _field_counts_from_data_sizes(data_sizes) -> dict[str, int]:
-    counts: dict[str, int] = {}
+def _field_counts_from_data_sizes(data_sizes) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
     for path, value in jtu.tree_leaves_with_path(data_sizes):
         field = "/".join(_render_path_elem(part) for part in path)
         counts[field] = int(value)
