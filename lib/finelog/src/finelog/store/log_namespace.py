@@ -459,7 +459,6 @@ class DiskLogNamespace:
         insertion_lock: Lock,
         query_visibility_lock: RWLock,
         duckdb_memory_limit: str,
-        duckdb_threads: str,
         read_pool: _ReadPoolProtocol,
         catalog: Catalog,
     ) -> None:
@@ -483,10 +482,14 @@ class DiskLogNamespace:
         # _next_seq).
         self._flush_lock = Lock()
 
-        # Per-namespace compaction connection. Cross-namespace COPYs would
-        # collide on a shared connection's session state, and we don't run
-        # cross-namespace queries through this conn anyway.
-        self._compaction_conn = duckdb.connect(config={"memory_limit": duckdb_memory_limit, "threads": duckdb_threads})
+        # Compaction uses a fresh DuckDB connection per merge (see
+        # ``_open_compaction_conn``). DuckDB's per-connection spill
+        # accountant leaks bytes when a COPY fails; reusing one long-lived
+        # connection eventually wedges with a bogus "165 GiB / 16383 PiB
+        # used" OOM. A short-lived per-merge conn sidesteps the leak,
+        # and the connect cost (~ms) is negligible vs. a multi-second COPY.
+        self._compaction_tmp = data_dir / ".duckdb_tmp"
+        self._compaction_conn_memory_limit = duckdb_memory_limit
         self._read_pool = read_pool
         self._catalog = catalog
 
@@ -551,6 +554,24 @@ class DiskLogNamespace:
             daemon=True,
         )
         self._bg_thread.start()
+
+    def _open_compaction_conn(self) -> duckdb.DuckDBPyConnection:
+        """Fresh DuckDB connection for one compaction COPY.
+
+        Opened per-merge so DuckDB's per-conn spill accountant resets
+        (it leaks bytes after failed COPYs). ``preserve_insertion_order``
+        is off because the COPY ``ORDER BY``s explicitly, and
+        ``threads=2`` caps the per-thread sort buffer footprint.
+        """
+        self._compaction_tmp.mkdir(parents=True, exist_ok=True)
+        return duckdb.connect(
+            config={
+                "memory_limit": self._compaction_conn_memory_limit,
+                "threads": "2",
+                "temp_directory": str(self._compaction_tmp),
+                "preserve_insertion_order": "false",
+            }
+        )
 
     def append_log_batch(self, items: list[tuple[str, list]]) -> None:
         """Log-namespace-only append for ``PushLogs`` RPCs.
@@ -673,14 +694,12 @@ class DiskLogNamespace:
         # and re-discovery on boot brings them back. The store-wide copy
         # worker handles L1+ uploads independently.
         self._flush_step()
-        self._compaction_conn.close()
 
     def stop_and_join(self) -> None:
         """Stop the bg thread without flushing or compacting (used by ``DropTable``)."""
         self._stop.set()
         self._wake.set()
         self._bg_thread.join()
-        self._compaction_conn.close()
 
     def ram_bytes(self) -> int:
         return self._buffers.ram_bytes()
@@ -997,7 +1016,8 @@ class DiskLogNamespace:
         # ``_insertion_lock`` protects, so we run it lock-free. A multi-second
         # COPY would otherwise stall every concurrent ``append_log_batch``.
         try:
-            self._compaction_conn.execute(sql)
+            with self._open_compaction_conn() as conn:
+                conn.execute(sql)
         except Exception:
             logger.warning("Compaction failed, leaving inputs in place", exc_info=True)
             staging_path.unlink(missing_ok=True)
@@ -1265,8 +1285,8 @@ class DiskLogNamespace:
         order = "ORDER BY seq DESC" if (tail and max_lines > 0) else "ORDER BY seq"
         limit = f"LIMIT {max_lines}" if max_lines > 0 else ""
 
-        with self._read_pool.checkout(ram_tables) as (conn, ram_names):
-            source = _build_union_source(parquet_files, ram_names, self._arrow_schema)
+        with self._read_pool.cursor(buffers={"_ram": ram_tables} if ram_tables else None) as conn:
+            source = _build_union_source(parquet_files, ["_ram"] if ram_tables else [], self._arrow_schema)
             sql = f"SELECT {select_cols} FROM ({source}) WHERE {where_clause} {order} {limit}"
             return conn.execute(sql, params).fetchall()
 
@@ -1361,8 +1381,8 @@ class MemoryLogNamespace:
         limit = f"LIMIT {max_lines}" if max_lines > 0 else ""
         where_clause = " AND ".join(where_parts)
 
-        with self._read_pool.checkout([table]) as (conn, ram_names):
-            source = _build_union_source([], ram_names, self._arrow_schema)
+        with self._read_pool.cursor(buffers={"_ram": [table]}) as conn:
+            source = _build_union_source([], ["_ram"], self._arrow_schema)
             sql = f"SELECT {select_cols} FROM ({source}) WHERE {where_clause} {order} {limit}"
             rows = conn.execute(sql, params).fetchall()
 
@@ -1422,9 +1442,10 @@ class MemoryLogNamespace:
 
 
 class _ReadPoolProtocol(Protocol):
-    def checkout(
-        self, buffer_tables: list[pa.Table]
-    ) -> AbstractContextManager[tuple[duckdb.DuckDBPyConnection, list[str]]]: ...
+    def cursor(
+        self,
+        buffers: dict[str, list[pa.Table]] | None = None,
+    ) -> AbstractContextManager[duckdb.DuckDBPyConnection]: ...
 
 
 def _assert_additive_schema_evolution(old: Schema, new: Schema) -> None:
