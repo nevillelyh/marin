@@ -164,11 +164,8 @@ class TreeCache(AsyncDataset[T_co]):
 
     def get_batch_sync(self, indices_or_slice, *, timeout: Optional[float] = None):
         if isinstance(indices_or_slice, slice):
-            indices_or_slice = range(
-                indices_or_slice.start or 0,
-                indices_or_slice.stop or len(self),
-                indices_or_slice.step or 1,
-            )
+            start, stop, step = indices_or_slice.indices(len(self))
+            indices_or_slice = range(start, stop, step)
         if self.is_sharded:
             return self._get_sharded_batch_sync(indices_or_slice)
         return self.store.get_batch_sync(indices_or_slice)

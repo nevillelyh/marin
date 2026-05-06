@@ -212,3 +212,19 @@ async def test_tree_cache_get_batch_slice_uses_python_slice_semantics():
         assert await cache.get_batch(slice(0, 0)) == []
         with pytest.raises(ValueError, match="slice step cannot be zero"):
             await cache.get_batch(slice(None, None, 0))
+
+
+def test_tree_cache_get_batch_sync_slice_uses_python_slice_semantics():
+    with tempfile.TemporaryDirectory(prefix="levanter-test-sharded-get-batch-sync-slice-") as tmpdir:
+        shard_paths = []
+        for i in range(NUM_SHARDS):
+            shard_path = os.path.join(tmpdir, f"part-{i:05d}")
+            _build_shard_cache(shard_path, i)
+            shard_paths.append(shard_path)
+
+        consolidate_shard_caches(shard_paths, tmpdir, EXEMPLAR_FLAT)
+        cache = TreeCache.load(tmpdir, EXEMPLAR_FLAT)
+
+        assert cache.get_batch_sync(slice(0, 0)) == []
+        with pytest.raises(ValueError, match="slice step cannot be zero"):
+            cache.get_batch_sync(slice(None, None, 0))
