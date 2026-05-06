@@ -10,9 +10,9 @@ import operator
 import os
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, TypeVar, Union
+from typing import Any, Dict, List, Optional, Protocol, Sequence, TypeVar, Union, cast
 
 import deepdiff
 import jax
@@ -109,17 +109,16 @@ class TreeCache(AsyncDataset[T_co]):
         if not ledger.is_finished:
             raise RuntimeError(f"Cache at {cache_dir} is not finished.")
 
-        self._store = None
         if self.is_sharded:
             _validate_sharded_ledger(ledger)
+            self._reader: _TreeCacheReader[T_co] = _ShardedTreeCacheReader(self)
         else:
-            self._store = TreeStore.open(self._exemplar, self.cache_dir, mode="r", cache_metadata=False)
+            store = TreeStore.open(self._exemplar, self.cache_dir, mode="r", cache_metadata=False)
+            self._reader = _MaterializedTreeCacheReader(store)
 
     @property
     def store(self) -> TreeStore[T_co]:
-        if self._store is None:
-            raise RuntimeError(f"Cache at {self.cache_dir} is sharded and has no top-level TreeStore.")
-        return self._store
+        return self._reader.store
 
     @property
     def is_sharded(self) -> bool:
@@ -131,101 +130,40 @@ class TreeCache(AsyncDataset[T_co]):
         return os.path.join(self.cache_dir, shard_name)
 
     async def async_len(self) -> int:
-        if self.is_sharded:
-            return self.ledger.total_num_rows
-        return len(self.store)
+        return await self._reader.async_len()
 
     def __len__(self):
-        if self.is_sharded:
-            return self.ledger.total_num_rows
-        return len(self.store)
+        return len(self._reader)
 
     def is_finite(self) -> bool:
         return True
 
     def __getitem__(self, item):
-        if self.is_sharded:
-            if isinstance(item, slice):
-                start, stop, step = item.indices(len(self))
-                return self.get_batch_sync(range(start, stop, step))
-            return self.get_batch_sync([item])[0]
-        return self.store[item]
+        return self._reader[item]
 
     def __iter__(self):
-        if self.is_sharded:
-            for index in range(len(self)):
-                yield self[index]
-            return
-        yield from self.store
+        yield from self._reader
 
-    async def get_batch(self, indices: Sequence[int] | slice):
-        if isinstance(indices, slice):
-            start, stop, step = indices.indices(len(self))
-            indices = range(start, stop, step)
-        if self.is_sharded:
-            return await self._get_sharded_batch(indices)
-        return await self.store.get_batch(indices)
+    async def get_batch(self, indices: Sequence[int]) -> Sequence[T_co]:
+        return await self._reader.get_batch(indices)
 
-    def get_batch_sync(self, indices_or_slice, *, timeout: Optional[float] = None):
-        if isinstance(indices_or_slice, slice):
-            start, stop, step = indices_or_slice.indices(len(self))
-            indices_or_slice = range(start, stop, step)
-        if self.is_sharded:
-            return self._get_sharded_batch_sync(indices_or_slice)
-        return self.store.get_batch_sync(indices_or_slice)
+    def get_batch_sync(self, indices_or_slice, *, timeout: Optional[float] = None) -> Sequence[T_co]:
+        return self._reader.get_batch_sync(indices_or_slice, timeout=timeout)
 
     def flat_field_length(self, field: str) -> int:
-        field_count = self.ledger.field_counts.get(field)
-        if field_count is not None:
-            return field_count
-
-        if self.is_sharded:
-            if self.ledger.total_num_rows == 0:
-                return 0
-            raise ValueError(f"Sharded cache ledger missing aggregate {field} count")
-
-        return _tree_field(self.store.tree, field).data_size
+        return self._reader.flat_field_length(field)
 
     async def async_flat_field_length(self, field: str) -> int:
-        field_count = self.ledger.field_counts.get(field)
-        if field_count is not None:
-            return field_count
-
-        if self.is_sharded:
-            if self.ledger.total_num_rows == 0:
-                return 0
-            raise ValueError(f"Sharded cache ledger missing aggregate {field} count")
-
-        return await _tree_field(self.store.tree, field).data_size_async()
+        return await self._reader.async_flat_field_length(field)
 
     def flat_field_num_rows(self, field: str) -> int:
-        if self.is_sharded:
-            return self.ledger.total_num_rows
-        return _tree_field(self.store.tree, field).num_rows
+        return self._reader.flat_field_num_rows(field)
 
     def jagged_array_tree(self):
-        if not self.is_sharded:
-            return self.store.tree
-
-        def field_store(path, _):
-            field = "/".join(_render_path_elem(part) for part in path)
-            return _ShardedJaggedArrayStore(self, field)
-
-        return jtu.tree_map_with_path(field_store, self._exemplar)
+        return self._reader.jagged_array_tree()
 
     async def get_flat_field_batch(self, field: str, offsets: Sequence[int], length: int) -> Sequence[np.ndarray]:
-        if len(offsets) == 0:
-            return []
-
-        if self.is_sharded:
-            return await asyncio.gather(
-                *[self._get_sharded_flat_field(field, int(offset), length) for offset in offsets]
-            )
-
-        field_store = _tree_field(self.store.tree, field)
-        with ts.Batch():
-            futures = [field_store.data[int(offset) : int(offset) + length].read() for offset in offsets]
-        return await asyncio.gather(*futures)
+        return await self._reader.get_flat_field_batch(field, offsets, length)
 
     def _ensure_shard_row_offsets(self) -> tuple[list[str], np.ndarray]:
         if self._shard_row_offsets is not None:
@@ -417,6 +355,160 @@ class TreeCache(AsyncDataset[T_co]):
     @property
     def is_finished(self):
         return True
+
+
+class _TreeCacheReader(Protocol[T_co]):
+    @property
+    def store(self) -> TreeStore[T_co]: ...
+
+    async def async_len(self) -> int: ...
+
+    def __len__(self) -> int: ...
+
+    def __getitem__(self, item) -> T_co | Sequence[T_co]: ...
+
+    def __iter__(self) -> Iterator[T_co]: ...
+
+    async def get_batch(self, indices: Sequence[int] | slice) -> Sequence[T_co]: ...
+
+    def get_batch_sync(self, indices_or_slice, *, timeout: Optional[float] = None) -> Sequence[T_co]: ...
+
+    def flat_field_length(self, field: str) -> int: ...
+
+    async def async_flat_field_length(self, field: str) -> int: ...
+
+    def flat_field_num_rows(self, field: str) -> int: ...
+
+    def jagged_array_tree(self) -> Any: ...
+
+    async def get_flat_field_batch(self, field: str, offsets: Sequence[int], length: int) -> Sequence[np.ndarray]: ...
+
+
+class _MaterializedTreeCacheReader:
+    def __init__(self, store: TreeStore[T_co]):
+        self._store = store
+
+    @property
+    def store(self) -> TreeStore[T_co]:
+        return self._store
+
+    async def async_len(self) -> int:
+        return len(self._store)
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+    def __getitem__(self, item) -> T_co | Sequence[T_co]:
+        return self._store[item]
+
+    def __iter__(self) -> Iterator[T_co]:
+        for row in self._store:
+            yield cast(T_co, row)
+
+    async def get_batch(self, indices: Sequence[int] | slice) -> Sequence[T_co]:
+        if isinstance(indices, slice):
+            start, stop, step = indices.indices(len(self))
+            indices = range(start, stop, step)
+        return await self._store.get_batch(indices)
+
+    def get_batch_sync(self, indices_or_slice, *, timeout: Optional[float] = None) -> Sequence[T_co]:
+        if isinstance(indices_or_slice, slice):
+            start, stop, step = indices_or_slice.indices(len(self))
+            indices_or_slice = range(start, stop, step)
+        return self._store.get_batch_sync(indices_or_slice)
+
+    def flat_field_length(self, field: str) -> int:
+        return _tree_field(self._store.tree, field).data_size
+
+    async def async_flat_field_length(self, field: str) -> int:
+        return await _tree_field(self._store.tree, field).data_size_async()
+
+    def flat_field_num_rows(self, field: str) -> int:
+        return _tree_field(self._store.tree, field).num_rows
+
+    def jagged_array_tree(self) -> Any:
+        return self._store.tree
+
+    async def get_flat_field_batch(self, field: str, offsets: Sequence[int], length: int) -> Sequence[np.ndarray]:
+        if len(offsets) == 0:
+            return []
+
+        field_store = _tree_field(self._store.tree, field)
+        with ts.Batch():
+            futures = [field_store.data[int(offset) : int(offset) + length].read() for offset in offsets]
+        return await asyncio.gather(*futures)
+
+
+class _ShardedTreeCacheReader:
+    def __init__(self, cache: TreeCache[T_co]):
+        self._cache = cache
+
+    @property
+    def store(self) -> TreeStore[T_co]:
+        raise RuntimeError(f"Cache at {self._cache.cache_dir} is sharded and has no top-level TreeStore.")
+
+    async def async_len(self) -> int:
+        return self._cache.ledger.total_num_rows
+
+    def __len__(self) -> int:
+        return self._cache.ledger.total_num_rows
+
+    def __getitem__(self, item) -> T_co | Sequence[T_co]:
+        if isinstance(item, slice):
+            start, stop, step = item.indices(len(self))
+            return self.get_batch_sync(range(start, stop, step))
+        return self.get_batch_sync([item])[0]
+
+    def __iter__(self) -> Iterator[T_co]:
+        for index in range(len(self)):
+            yield cast(T_co, self.get_batch_sync([index])[0])
+
+    async def get_batch(self, indices: Sequence[int] | slice) -> Sequence[T_co]:
+        if isinstance(indices, slice):
+            start, stop, step = indices.indices(len(self))
+            indices = range(start, stop, step)
+        return await self._cache._get_sharded_batch(indices)
+
+    def get_batch_sync(self, indices_or_slice, *, timeout: Optional[float] = None) -> Sequence[T_co]:
+        if isinstance(indices_or_slice, slice):
+            start, stop, step = indices_or_slice.indices(len(self))
+            indices_or_slice = range(start, stop, step)
+        return self._cache._get_sharded_batch_sync(indices_or_slice)
+
+    def flat_field_length(self, field: str) -> int:
+        field_count = self._cache.ledger.field_counts.get(field)
+        if field_count is not None:
+            return field_count
+
+        if self._cache.ledger.total_num_rows == 0:
+            return 0
+        raise ValueError(f"Sharded cache ledger missing aggregate {field} count")
+
+    async def async_flat_field_length(self, field: str) -> int:
+        field_count = self._cache.ledger.field_counts.get(field)
+        if field_count is not None:
+            return field_count
+
+        if self._cache.ledger.total_num_rows == 0:
+            return 0
+        raise ValueError(f"Sharded cache ledger missing aggregate {field} count")
+
+    def flat_field_num_rows(self, field: str) -> int:
+        return self._cache.ledger.total_num_rows
+
+    def jagged_array_tree(self) -> Any:
+        def field_store(path, _):
+            field = "/".join(_render_path_elem(part) for part in path)
+            return _ShardedJaggedArrayStore(self._cache, field)
+
+        return jtu.tree_map_with_path(field_store, self._cache._exemplar)
+
+    async def get_flat_field_batch(self, field: str, offsets: Sequence[int], length: int) -> Sequence[np.ndarray]:
+        if len(offsets) == 0:
+            return []
+        return await asyncio.gather(
+            *[self._cache._get_sharded_flat_field(field, int(offset), length) for offset in offsets]
+        )
 
 
 @dataclass_json
