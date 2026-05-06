@@ -929,6 +929,8 @@ def count_corpus_sizes(
         )
         train_seqs = len(train_set.as_sync_dataset())
         stats[f"{metric_prefix}total_seqs"] = train_seqs
+        if train_seqs == 0 or seq_len == 0:
+            continue
         padding_fraction = 1 - (total_tokens / (train_seqs * seq_len))
         if padding_fraction < 0:
             stats[f"{metric_prefix}truncation_fraction"] = -padding_fraction
