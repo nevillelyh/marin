@@ -156,7 +156,8 @@ class TreeCache(AsyncDataset[T_co]):
 
     async def get_batch(self, indices: Sequence[int] | slice):
         if isinstance(indices, slice):
-            indices = range(indices.start or 0, indices.stop or len(self), indices.step or 1)
+            start, stop, step = indices.indices(len(self))
+            indices = range(start, stop, step)
         if self.is_sharded:
             return await self._get_sharded_batch(indices)
         return await self.store.get_batch(indices)
