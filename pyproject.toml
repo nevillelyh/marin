@@ -20,11 +20,23 @@ dependencies = [
     "marin-zephyr",
     # top level deps. try to keep these small.
     "watchdog",
-    "marin-dupekit >= 0.1.0",
+    # `>= 0.1.0.dev0` opts uv into pre-releases for this one package so the
+    # daily nightly published by .github/workflows/dupekit-release-wheels.yaml
+    # (`X.Y.Z.dev<YYYYMMDDhhmm>`) is picked up by `uv lock` automatically.
+    # Cut a stable tag (`dupekit-v<X.Y.Z>`) when promoting; uv prefers the
+    # higher version, so a stable supersedes any earlier dev of the same Z.
+    "marin-dupekit >= 0.1.0.dev0",
 ]
 
 [tool.uv]
 fork-strategy = "fewest"
+# Allow pre-releases globally so `uv lock` resolves marin-dupekit to its
+# latest nightly (`X.Y.Z.dev<timestamp>` published by the dupekit release
+# workflow). uv has no per-package prerelease config; in practice almost
+# none of our other dependencies publish pre-releases on PyPI, so this
+# only affects dupekit and the already-pinned `omegaconf>=2.4.0.dev4`
+# below.
+prerelease = "allow"
 find-links = [
     "https://github.com/marin-community/kitoken/releases/expanded_assets/kitoken-0.10.2-a3012f4",
 ]
