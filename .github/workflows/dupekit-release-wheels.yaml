@@ -32,7 +32,7 @@ jobs:
           filters: |
             relevant:
               - 'rust/dupekit/**'
-              - 'scripts/rust_package.py'
+              - 'rust/dupekit/build_package.py'
               - '.github/workflows/dupekit-release-wheels.yaml'
 
   # Linux wheels (x86_64 + aarch64) cross-compiled via zig on ubuntu.
@@ -44,9 +44,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            targets: linux
+            target: linux
           - os: macos-14
-            targets: macos
+            target: macos
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -54,7 +54,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
 
       - name: Build wheels
-        run: python scripts/rust_package.py --skip-publish --targets ${{ matrix.targets }}
+        run: python rust/dupekit/build_package.py --bump --build ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -65,20 +65,42 @@ jobs:
     if: needs.changes.outputs.should_run == 'true' && github.ref == 'refs/heads/main'
     needs: [changes, build]
     runs-on: ubuntu-latest
+    environment: pypi-publish
+    permissions:
+      id-token: write
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
 
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      # Branch setup must happen BEFORE rust_package.py so the wheel-pin
-      # modifications land on the PR branch's tree, not get clobbered by a
-      # later checkout. Resetting to $GITHUB_SHA gives rust_package a clean
-      # baseline to write on top of, regardless of what the existing PR
-      # branch contained.
+      # Build the sdist exactly once here (not per matrix leg) so the upload
+      # to PyPI gets one canonical sdist tarball at the bumped version. The
+      # bump must match what the matrix legs computed - both read the same
+      # Cargo.toml from $GITHUB_SHA and bump patch by 1, so they agree.
+      # Captures the bumped version into outputs.version so the auto-PR step
+      # downstream can pin to the exact published version without re-reading
+      # (and accidentally re-bumping) Cargo.toml.
+      - name: Bump version and build sdist
+        id: bump
+        run: python rust/dupekit/build_package.py --bump --build sdist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.12.4
+        with:
+          packages-dir: dist/
+
+      # Branch setup happens AFTER the PyPI publish so a publish failure does
+      # not poison the auto-PR. We always reset the worktree to $GITHUB_SHA so
+      # that --set-version below writes onto a known-clean baseline regardless
+      # of whether the auto-PR branch already exists on origin.
       - name: Set up release branch
         env:
           BRANCH: auto/update-dupekit-wheels
@@ -89,15 +111,20 @@ jobs:
           git fetch origin "$BRANCH" --depth=1 2>/dev/null || true
           if git rev-parse --verify --quiet "refs/remotes/origin/$BRANCH" >/dev/null; then
             git checkout -B "$BRANCH" "refs/remotes/origin/$BRANCH"
-            git checkout "$GITHUB_SHA" -- .
           else
             git checkout -B "$BRANCH"
           fi
+          git checkout "$GITHUB_SHA" -- .
 
-      - name: Publish release and update pyproject
+      # Pin Cargo.toml + root pyproject.toml to the exact version we just
+      # published. Using --set-version (not --bump) makes this idempotent and
+      # removes the implicit "Cargo.toml must be at $GITHUB_SHA's version"
+      # invariant from the previous --bump-twice design.
+      - name: Pin pyproject to published version
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python scripts/rust_package.py --skip-build
+          PUBLISHED_VERSION: ${{ steps.bump.outputs.version }}
+        run: python rust/dupekit/build_package.py --set-version "$PUBLISHED_VERSION" --update-pyproject
 
       - name: Open or update PR
         env:

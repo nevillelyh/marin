@@ -59,6 +59,7 @@ logger = logging.getLogger(__name__)
 # Trailing stderr lines scanned for TPU bad-node signatures on non-zero exit.
 _TPU_STDERR_TAIL_LINES = 200
 
+
 # Signal numbers for interpreting exit codes > 128
 _SIGNAL_NAMES = {
     6: "SIGABRT",
