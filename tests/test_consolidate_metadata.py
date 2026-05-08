@@ -8,6 +8,7 @@ import tempfile
 
 import numpy as np
 import pytest
+from levanter.data.packing import GreedyPrepackedDataset
 from levanter.data.text.datasets import TokenSeqDataset
 from levanter.store.cache import (
     CACHE_LAYOUT_CONSOLIDATED,
@@ -219,6 +220,56 @@ async def test_token_seq_dataset_reads_sharded_cache():
         np.testing.assert_array_equal(batch[0], np.array(all_tokens[0:4], dtype=np.int32))
         np.testing.assert_array_equal(batch[1], np.array(all_tokens[12:16], dtype=np.int32))
         np.testing.assert_array_equal(batch[2], np.array(all_tokens[16:20], dtype=np.int32))
+
+
+@pytest.mark.asyncio
+async def test_greedy_prepacked_dataset_reads_sharded_cache():
+    with tempfile.TemporaryDirectory(prefix="levanter-test-sharded-packing-") as tmpdir:
+        shard_paths = []
+        for i in range(NUM_SHARDS):
+            shard_path = os.path.join(tmpdir, f"part-{i:05d}")
+            _build_shard_cache(shard_path, i)
+            shard_paths.append(shard_path)
+
+        consolidate_shard_cache_ledgers(shard_paths, tmpdir, EXEMPLAR_FLAT)
+        cache = TreeCache.load(tmpdir, EXEMPLAR_FLAT)
+        packed = GreedyPrepackedDataset(
+            cache.jagged_array_tree(),
+            max_length=2 * ROW_WIDTH,
+            max_segments_per_example=2,
+            pad_with_zeros=True,
+            slice_strategy="raise",
+        )
+
+        batch = await packed.get_batch([0, 1])
+
+        np.testing.assert_array_equal(
+            batch[0][0]["input_ids"],
+            np.concatenate(
+                [
+                    np.arange(ROW_WIDTH, dtype=np.int32),
+                    np.arange(ROW_WIDTH, dtype=np.int32) + 10,
+                ]
+            ),
+        )
+        np.testing.assert_array_equal(
+            batch[0][1]["input_ids"],
+            np.array([0] * ROW_WIDTH + [1] * ROW_WIDTH),
+        )
+
+        np.testing.assert_array_equal(
+            batch[1][0]["input_ids"],
+            np.concatenate(
+                [
+                    np.arange(ROW_WIDTH, dtype=np.int32) + 20,
+                    np.arange(ROW_WIDTH, dtype=np.int32) + 100,
+                ]
+            ),
+        )
+        np.testing.assert_array_equal(
+            batch[1][1]["input_ids"],
+            np.array([2] * ROW_WIDTH + [3] * ROW_WIDTH),
+        )
 
 
 @pytest.mark.asyncio
