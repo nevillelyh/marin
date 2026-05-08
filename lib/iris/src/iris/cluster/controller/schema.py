@@ -602,6 +602,11 @@ JOBS = Table(
         "CREATE INDEX IF NOT EXISTS idx_jobs_name ON jobs(name)",
         "CREATE INDEX IF NOT EXISTS idx_jobs_has_reservation"
         " ON jobs(has_reservation, state) WHERE has_reservation = 1",
+        # Migration 0045: feeds the per-tick reservation-holder filter in
+        # ``TaskAttemptStore.resource_usage_by_worker``. ~200 rows on a
+        # production-scale DB; full table scan would otherwise dominate the
+        # scheduling-tick read.
+        "CREATE INDEX IF NOT EXISTS idx_jobs_reservation_holder" " ON jobs(job_id) WHERE is_reservation_holder = 1",
     ),
 )
 
@@ -825,8 +830,14 @@ TASK_ATTEMPTS = Table(
     table_constraints=("PRIMARY KEY (task_id, attempt_id)",),
     indexes=(
         # Migration 0007 (recreated in 0019 after table rebuild)
-        "CREATE INDEX IF NOT EXISTS idx_task_attempts_worker_task"
-        " ON task_attempts(worker_id, task_id, attempt_id)",
+        "CREATE INDEX IF NOT EXISTS idx_task_attempts_worker_task" " ON task_attempts(worker_id, task_id, attempt_id)",
+        # Migration 0045: feeds ``resource_usage_by_worker`` and
+        # ``reconcile_rows_for_workers`` — the per-tick reads that derive
+        # capacity and drive the polling reconcile. Without this the planner
+        # falls back to scanning ~24k jobs as the driving table; with it the
+        # scheduling tick stays at ~3 ms.
+        "CREATE INDEX IF NOT EXISTS idx_task_attempts_live_workerbound"
+        " ON task_attempts(worker_id) WHERE worker_id IS NOT NULL AND finished_at_ms IS NULL",
     ),
 )
 
@@ -862,26 +873,8 @@ WORKERS = Table(
         # Migration 0022
         Column("slice_id", "TEXT", "NOT NULL DEFAULT ''", python_type=str, decoder=str, default=""),
         Column("scale_group", "TEXT", "NOT NULL DEFAULT ''", python_type=str, decoder=str, default=""),
-        # Committed-resource totals — only the scheduler writes these.
-        Column(
-            "committed_cpu_millicores",
-            "INTEGER",
-            "NOT NULL DEFAULT 0",
-            python_type=int,
-            decoder=int,
-            default=0,
-        ),
-        Column(
-            "committed_mem_bytes",
-            "INTEGER",
-            "NOT NULL DEFAULT 0",
-            python_name="committed_mem",
-            python_type=int,
-            decoder=int,
-            default=0,
-        ),
-        Column("committed_gpu", "INTEGER", "NOT NULL DEFAULT 0", python_type=int, decoder=int, default=0),
-        Column("committed_tpu", "INTEGER", "NOT NULL DEFAULT 0", python_type=int, decoder=int, default=0),
+        # Worker resource usage was previously cached in committed_*; it is now
+        # derived from unfinished worker-bound task_attempts (see migration 0043).
     ),
 )
 
@@ -948,34 +941,6 @@ ENDPOINTS = Table(
         # Migration 0009
         "CREATE INDEX IF NOT EXISTS idx_endpoints_job_id ON endpoints(job_id)",
     ),
-)
-
-# Migration 0011: dispatch_queue with nullable worker_id
-DISPATCH_QUEUE = Table(
-    "dispatch_queue",
-    "dq",
-    columns=(
-        Column("id", "INTEGER", "PRIMARY KEY AUTOINCREMENT"),
-        Column(
-            "worker_id",
-            "TEXT",
-            "REFERENCES workers(worker_id) ON DELETE CASCADE",
-            python_type=WorkerId | None,
-            decoder=_nullable(decode_worker_id),
-        ),
-        Column("kind", "TEXT", "NOT NULL CHECK (kind IN ('run', 'kill'))", python_type=str, decoder=str),
-        Column("payload_proto", "BLOB", "", expensive=True),
-        Column("task_id", "TEXT", "", python_type=str | None, decoder=_nullable(str)),
-        Column(
-            "created_at_ms",
-            "INTEGER",
-            "NOT NULL",
-            python_name="created_at",
-            python_type=Timestamp,
-            decoder=decode_timestamp_ms,
-        ),
-    ),
-    indexes=("CREATE INDEX IF NOT EXISTS idx_dispatch_worker ON dispatch_queue(worker_id, id)",),
 )
 
 # Migration 0003: restructured scaling_groups
@@ -1176,7 +1141,6 @@ MAIN_TABLES: tuple[Table, ...] = (
     WORKERS,
     WORKER_ATTRIBUTES,
     ENDPOINTS,
-    DISPATCH_QUEUE,
     SCALING_GROUPS,
     SLICES,
     RESERVATION_CLAIMS,
@@ -1292,6 +1256,19 @@ class JobDetailRow:
 
 
 @dataclass(frozen=True, slots=True)
+class JobReservationRow:
+    """Slim row for the per-tick reservation-claim recomputation.
+
+    Decodes only the two columns the reservation loop touches — keeping the
+    JSON proto blobs and other 35 ``JobDetailRow`` columns out of the hot
+    path. See ``_jobs_with_reservations`` in ``controller.py``.
+    """
+
+    job_id: JobName
+    reservation_json: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class TaskRow:
     """Lightweight task row for scheduling."""
 
@@ -1333,7 +1310,7 @@ class TaskDetailRow:
 
 @dataclass(frozen=True, slots=True)
 class WorkerRow:
-    """Durable worker columns: identity, capability, and committed scheduling totals."""
+    """Durable worker columns: identity and capability."""
 
     worker_id: WorkerId
     address: str
@@ -1343,10 +1320,6 @@ class WorkerRow:
     total_tpu_count: int
     device_type: str
     device_variant: str
-    committed_cpu_millicores: int
-    committed_mem: int
-    committed_gpu: int
-    committed_tpu: int
     attributes: dict = dataclasses.field(default_factory=dict)
 
 
@@ -1362,10 +1335,6 @@ class WorkerDetailRow:
     total_tpu_count: int
     device_type: str
     device_variant: str
-    committed_cpu_millicores: int
-    committed_mem: int
-    committed_gpu: int
-    committed_tpu: int
     md_hostname: str
     md_ip_address: str
     md_cpu_count: int
@@ -1532,10 +1501,6 @@ WORKER_ROW_PROJECTION = WORKERS.projection(
     "total_tpu_count",
     "device_type",
     "device_variant",
-    "committed_cpu_millicores",
-    "committed_mem_bytes",
-    "committed_gpu",
-    "committed_tpu",
     extra_fields=(ExtraField("attributes", dict, default_factory=dict),),
     row_cls=WorkerRow,
 )
@@ -1606,6 +1571,21 @@ JOB_DETAIL_PROJECTION = Projection(
     column_aliases=_job_detail_aliases,
 )
 
+# Slim 2-column projection for the per-tick reservation-claim recomputation
+# (``_jobs_with_reservations``). The reservation loop reads only ``job_id`` and
+# ``reservation_json`` — decoding the full ``JOB_DETAIL_PROJECTION`` (37 cols
+# including JSON proto blobs) on every scheduling tick is pure waste.
+_job_reservation_cols, _job_reservation_aliases = _job_columns(
+    "job_id",
+    "reservation_json",
+)
+JOB_RESERVATION_PROJECTION = Projection(
+    JOBS,
+    _job_reservation_cols,
+    row_cls=JobReservationRow,
+    column_aliases=_job_reservation_aliases,
+)
+
 # Full task detail — superset of TaskRow, adds diagnostics and attempts.
 TASK_DETAIL_PROJECTION = TASKS.projection(
     "task_id",
@@ -1639,10 +1619,6 @@ WORKER_DETAIL_PROJECTION = WORKERS.projection(
     "total_tpu_count",
     "device_type",
     "device_variant",
-    "committed_cpu_millicores",
-    "committed_mem_bytes",
-    "committed_gpu",
-    "committed_tpu",
     "md_hostname",
     "md_ip_address",
     "md_cpu_count",

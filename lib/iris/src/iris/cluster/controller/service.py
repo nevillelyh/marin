@@ -23,7 +23,7 @@ from connectrpc.errors import ConnectError
 from connectrpc.request import RequestContext
 from finelog.client import LogClient
 from finelog.rpc import logging_pb2
-from rigging.timing import Timer, Timestamp
+from rigging.timing import Duration, ExponentialBackoff, Timer, Timestamp
 
 from iris.cluster.bundle import BundleStore
 from iris.cluster.constraints import Constraint, constraints_from_resources, merge_constraints, validate_tpu_request
@@ -131,6 +131,12 @@ DEFAULT_MAX_TOTAL_LINES = 100000
 
 # Maximum bundle size in bytes (25 MB) - matches client-side limit
 MAX_BUNDLE_SIZE_BYTES = 25 * 1024 * 1024
+
+# Time the launch RPC blocks waiting for a replaced job's worker-bound attempts
+# to finalize before deleting them. Normal worker shutdown is well under one
+# minute; the bound is finite so a stuck finalization surfaces as
+# DEADLINE_EXCEEDED rather than hanging launches forever.
+_JOB_REPLACEMENT_DRAIN_TIMEOUT = Duration.from_minutes(10)
 
 # A root LaunchJob submission is rejected if its client_revision_date is more
 # than FRESHNESS_WINDOW older than today. Clients get exactly this long to
@@ -318,14 +324,13 @@ def _job_state_counts_for_summary(job_state_counts: dict[int, int]) -> dict[str,
 # =============================================================================
 
 
-def _read_job(db: ControllerDB, job_id: JobName) -> JobDetailRow | None:
-    with db.read_snapshot() as q:
-        return JOB_DETAIL_PROJECTION.decode_one(
-            q.fetchall(
-                f"SELECT {JOB_DETAIL_PROJECTION.select_clause()} " f"FROM jobs j {JOB_CONFIG_JOIN} WHERE j.job_id = ?",
-                (job_id.to_wire(),),
-            )
+def _read_job(q: QuerySnapshot, job_id: JobName) -> JobDetailRow | None:
+    return JOB_DETAIL_PROJECTION.decode_one(
+        q.fetchall(
+            f"SELECT {JOB_DETAIL_PROJECTION.select_clause()} " f"FROM jobs j {JOB_CONFIG_JOIN} WHERE j.job_id = ?",
+            (job_id.to_wire(),),
         )
+    )
 
 
 def _read_task_with_attempts(db: ControllerDB, task_id: JobName) -> TaskDetailRow | None:
@@ -759,15 +764,10 @@ def _parent_ids_with_children(q: QuerySnapshot, job_ids: list[JobName]) -> set[J
     return {JobName.from_wire(row.parent_job_id) for row in rows if row.parent_job_id}
 
 
-def _task_summaries_for_jobs(q: QuerySnapshot, job_ids: set[JobName] | None = None) -> dict[JobName, TaskJobSummary]:
+def _task_summaries_for_jobs(q: QuerySnapshot, job_ids: set[JobName]) -> dict[JobName, TaskJobSummary]:
     """Aggregate task counts per job via a SQL GROUP BY."""
-    if job_ids is not None:
-        placeholders = ",".join("?" for _ in job_ids)
-        where = f"WHERE t.job_id IN ({placeholders})"
-        params: tuple[object, ...] = tuple(j.to_wire() for j in job_ids)
-    else:
-        where = ""
-        params = ()
+    placeholders = ",".join("?" for _ in job_ids)
+    params: tuple[object, ...] = tuple(j.to_wire() for j in job_ids)
 
     sql = f"""
         SELECT t.job_id,
@@ -776,7 +776,7 @@ def _task_summaries_for_jobs(q: QuerySnapshot, job_ids: set[JobName] | None = No
                SUM(t.failure_count) as total_failures,
                SUM(t.preemption_count) as total_preemptions
         FROM tasks t
-        {where}
+        WHERE t.job_id IN ({placeholders})
         GROUP BY t.job_id, t.state
     """
     completed_states = (job_pb2.TASK_STATE_SUCCEEDED, job_pb2.TASK_STATE_KILLED)
@@ -816,21 +816,6 @@ def _worker_roster(store: ControllerStore) -> list[WorkerDetailRow]:
             key, value = _decode_attribute_value(row)
             attrs_by_worker.setdefault(wid, {})[key] = value
     return [dataclasses.replace(w, attributes=attrs_by_worker.get(str(w.worker_id), {})) for w in decoded]
-
-
-def _descendant_jobs(db: ControllerDB, job_id: JobName) -> list[JobDetailRow]:
-    # PK range scan: '0' (ASCII 48) is the next char after '/' (ASCII 47),
-    # so this matches all job_ids starting with "<job_id>/" without LIKE.
-    prefix = job_id.to_wire() + "/"
-    upper = job_id.to_wire() + chr(ord("/") + 1)
-    with db.read_snapshot() as q:
-        return JOB_DETAIL_PROJECTION.decode(
-            q.fetchall(
-                f"SELECT {JOB_DETAIL_PROJECTION.select_clause()} FROM jobs j {JOB_CONFIG_JOIN} "
-                f"WHERE j.job_id >= ? AND j.job_id < ?",
-                (prefix, upper),
-            ),
-        )
 
 
 def _live_user_stats(db: ControllerDB) -> list[UserStats]:
@@ -935,12 +920,6 @@ class ControllerProtocol(Protocol):
     """Protocol for controller operations used by ControllerServiceImpl."""
 
     def wake(self) -> None: ...
-
-    def kill_tasks_on_workers(
-        self,
-        task_ids: set[JobName],
-        task_kill_workers: dict[JobName, WorkerId] | None = None,
-    ) -> None: ...
 
     def create_scheduling_context(self, workers: list[SchedulableWorker]) -> SchedulingContext: ...
 
@@ -1048,6 +1027,44 @@ class ControllerServiceImpl:
             return
         authorize_resource_owner(job_id.user)
 
+    def _wait_until_job_drained(self, job_id: JobName, timeout: Duration) -> None:
+        """Block until ``job_id`` has no unfinished worker-bound attempts.
+
+        Polls the snapshot DB; the heartbeat path landing terminal updates is
+        what finally clears the predicate. Used to gate ``remove_finished_job``
+        on a replacement so we never CASCADE-delete tasks whose attempts the
+        worker is still racing to finalize. Raises ``ConnectError`` with
+        ``DEADLINE_EXCEEDED`` if the job hasn't drained within ``timeout``.
+        """
+
+        def drained() -> bool:
+            with self._db.read_snapshot() as snap:
+                return not self._store.jobs.has_unfinished_worker_attempts(snap, job_id)
+
+        try:
+            ExponentialBackoff(initial=0.05, maximum=1.0, factor=1.5).wait_until_or_raise(
+                drained,
+                timeout=timeout,
+                error_message=f"Timed out waiting for job {job_id} to drain before replacement",
+            )
+        except TimeoutError as exc:
+            raise ConnectError(Code.DEADLINE_EXCEEDED, str(exc)) from exc
+
+    def _remove_finished_job_safely(self, cur, job_id: JobName) -> None:
+        """``remove_finished_job`` gated on no unfinished worker-bound attempts.
+
+        CASCADE-deleting a job's tasks while its attempts are still worker-
+        bound destroys the rows the heartbeat path needs to find when it
+        stamps ``finished_at_ms``. Every replacement / prune / admin-delete
+        path goes through here so that contract is uniform.
+        """
+        if self._store.jobs.has_unfinished_worker_attempts(cur, job_id):
+            raise ConnectError(
+                Code.FAILED_PRECONDITION,
+                f"Refusing to remove job {job_id}: worker-bound attempts have not finalized",
+            )
+        self._transitions.remove_finished_job(cur, job_id)
+
     def launch_job(
         self,
         request: controller_pb2.Controller.LaunchJobRequest,
@@ -1137,6 +1154,7 @@ class ControllerServiceImpl:
         # transaction further down — between the two txs another submitter
         # can race, but ``INSERT INTO jobs`` then PK-conflicts, which is a
         # legitimate error rather than a correctness bug.
+        needs_drain = False
         with self._store.transaction() as cur:
             existing_state = self._store.jobs.get_state(cur, job_id)
             if existing_state is not None:
@@ -1150,11 +1168,19 @@ class ControllerServiceImpl:
                     if not is_job_finished(existing_state):
                         return controller_pb2.Controller.LaunchJobResponse(job_id=job_id.to_wire())
                     # Job finished, replace it (KEEP only preserves running jobs)
-                    self._transitions.remove_finished_job(cur, job_id)
+                    self._remove_finished_job_safely(cur, job_id)
                 elif policy == job_pb2.EXISTING_JOB_POLICY_RECREATE:
                     if not is_job_finished(existing_state):
                         self._transitions.cancel_job(cur, job_id, "Replaced by new submission")
-                    self._transitions.remove_finished_job(cur, job_id)
+                        # Cancel is a producer transition: attempts stay
+                        # unfinished until the worker confirms termination.
+                        # Defer remove_finished_job to a second tx after the
+                        # drain wait so we don't destroy task_attempts rows
+                        # whose finished_at_ms write the heartbeat path is
+                        # still racing to land.
+                        needs_drain = True
+                    else:
+                        self._remove_finished_job_safely(cur, job_id)
                 elif is_job_finished(existing_state):
                     # Default/UNSPECIFIED: replace finished jobs
                     logger.info(
@@ -1162,9 +1188,18 @@ class ControllerServiceImpl:
                         job_id,
                         job_pb2.JobState.Name(existing_state),
                     )
-                    self._transitions.remove_finished_job(cur, job_id)
+                    self._remove_finished_job_safely(cur, job_id)
                 else:
                     raise ConnectError(Code.ALREADY_EXISTS, f"Job {job_id} already exists and is still running")
+
+        if needs_drain:
+            # Nudge the polling loop so workers see the cancelled tasks excluded
+            # from their expected set on the next reconcile and auto-kill the
+            # containers; the heartbeat path then stamps finished_at_ms.
+            self._controller.wake()
+            self._wait_until_job_drained(job_id, _JOB_REPLACEMENT_DRAIN_TIMEOUT)
+            with self._store.transaction() as cur:
+                self._remove_finished_job_safely(cur, job_id)
 
         # Handle bundle_blob: upload to bundle store, then replace blob
         # with the resulting GCS path (preserving all other fields).
@@ -1238,13 +1273,13 @@ class ControllerServiceImpl:
         cheap: one job row read + one GROUP BY query vs loading every task,
         attempt, and worker address.
         """
-        job = _read_job(self._db, JobName.from_wire(request.job_id))
-        if not job:
-            raise ConnectError(Code.NOT_FOUND, f"Job {request.job_id} not found")
-
-        # Aggregate task counts via a single GROUP BY query.
         with self._db.read_snapshot() as q:
+            job = _read_job(q, JobName.from_wire(request.job_id))
+            if not job:
+                raise ConnectError(Code.NOT_FOUND, f"Job {request.job_id} not found")
+            # Aggregate task counts via a single GROUP BY query.
             summaries = _task_summaries_for_jobs(q, {job.job_id})
+            has_children = bool(_parent_ids_with_children(q, [job.job_id]))
         summary = summaries.get(job.job_id)
 
         task_state_counts = (
@@ -1266,9 +1301,6 @@ class ControllerServiceImpl:
                 pending_reason = f"Scheduler: {pending_reason}\n\nAutoscaler: {scaling_prefix}{hint.message}"
 
         resources = _resource_spec_from_job_row(job)
-
-        with self._db.read_snapshot() as q:
-            has_children = bool(_parent_ids_with_children(q, [job.job_id]))
 
         proto_job_status = job_pb2.JobStatus(
             job_id=job.job_id.to_wire(),
@@ -1341,9 +1373,11 @@ class ControllerServiceImpl:
         # cancel_job uses a recursive CTE to walk the full subtree in a single
         # transaction, so there is no need to recurse manually.
         with self._store.transaction() as cur:
-            result = self._transitions.cancel_job(cur, job_id, reason="Terminated by user")
-        if result.tasks_to_kill:
-            self._controller.kill_tasks_on_workers(result.tasks_to_kill, result.task_kill_workers)
+            self._transitions.cancel_job(cur, job_id, reason="Terminated by user")
+        # The next polling tick reconciles each affected worker and sends
+        # StopTasks via the expected_tasks diff; wake the loops so it lands
+        # within one tick rather than waiting on the next backoff.
+        self._controller.wake()
         return job_pb2.Empty()
 
     def _job_to_proto(

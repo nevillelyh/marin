@@ -109,16 +109,20 @@ class FakeProvider:
     def ping_workers(self, workers):
         return []
 
-    def start_tasks(self, jobs):
+    def reconcile_workers(self, plans):
+        from iris.cluster.controller.worker_provider import WorkerReconcileResult
         from iris.rpc import worker_pb2
 
-        return [(wid, worker_pb2.Worker.StartTasksResponse(), None) for wid, _, _ in jobs]
-
-    def stop_tasks(self, jobs):
-        return [(wid, None) for wid, _, _ in jobs]
-
-    def poll_workers(self, running, worker_addresses):
-        return []
+        return [
+            WorkerReconcileResult(
+                worker_id=plan.worker_id,
+                start_response=worker_pb2.Worker.StartTasksResponse() if plan.start_tasks else None,
+                start_error=None,
+                poll_updates=[],
+                poll_error=None,
+            )
+            for plan in plans
+        ]
 
     def close(self) -> None:
         pass
@@ -136,7 +140,6 @@ class MockController:
 
     def __init__(self):
         self.wake = Mock()
-        self.kill_tasks_on_workers = Mock()
         self.create_scheduling_context = Mock(return_value=Mock())
         self.get_job_scheduling_diagnostics = Mock(return_value=None)
         self.autoscaler = None
@@ -361,10 +364,6 @@ class WorkerView:
     active: bool
     consecutive_failures: int
     last_heartbeat_ms: int
-    committed_cpu_millicores: int
-    committed_mem: int
-    committed_gpu: int
-    committed_tpu: int
 
 
 def _worker_view(row: WorkerRow, liveness) -> WorkerView:
@@ -382,10 +381,6 @@ def _worker_view(row: WorkerRow, liveness) -> WorkerView:
         active=liveness.active,
         consecutive_failures=liveness.consecutive_failures,
         last_heartbeat_ms=liveness.last_heartbeat_ms,
-        committed_cpu_millicores=row.committed_cpu_millicores,
-        committed_mem=row.committed_mem,
-        committed_gpu=row.committed_gpu,
-        committed_tpu=row.committed_tpu,
     )
 
 
