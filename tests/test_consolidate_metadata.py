@@ -90,18 +90,29 @@ def test_consolidate_shard_caches_writes_materialized_tree_store():
         )
 
 
-def test_relative_shard_path_keeps_external_local_paths_absolute():
+def test_relative_shard_path_requires_child_paths():
     with tempfile.TemporaryDirectory(prefix="levanter-test-shard-paths-") as tmpdir:
         output_path = os.path.join(tmpdir, "output")
         internal_shard = os.path.join(output_path, "part-00000")
         external_shard = os.path.join(tmpdir, "source", "part-00000")
 
         assert _relative_shard_path(output_path, internal_shard) == "part-00000"
-        assert _relative_shard_path(output_path, external_shard) == external_shard
+        with pytest.raises(ValueError, match="not under output path"):
+            _relative_shard_path(output_path, external_shard)
+
+
+def test_relative_shard_path_requires_child_uri_paths():
+    output_path = "gs://bucket/cache/train"
+    internal_shard = "gs://bucket/cache/train/part-00000"
+    external_shard = "gs://bucket/other/train/part-00000"
+
+    assert _relative_shard_path(output_path, internal_shard) == "part-00000"
+    with pytest.raises(ValueError, match="not under output path"):
+        _relative_shard_path(output_path, external_shard)
 
 
 @pytest.mark.asyncio
-async def test_consolidate_external_shards_uses_absolute_paths():
+async def test_consolidate_external_shards_rejected():
     with tempfile.TemporaryDirectory(prefix="levanter-test-external-shards-") as tmpdir:
         source_dir = os.path.join(tmpdir, "source")
         output_path = os.path.join(tmpdir, "output")
@@ -111,15 +122,8 @@ async def test_consolidate_external_shards_uses_absolute_paths():
             _build_shard_cache(shard_path, i)
             shard_paths.append(shard_path)
 
-        ledger = consolidate_shard_cache_ledgers(shard_paths, output_path, EXEMPLAR_FLAT)
-
-        assert ledger.finished_shards == shard_paths
-        cache = TreeCache.load(output_path, EXEMPLAR_FLAT)
-        dataset = TokenSeqDataset(cache, SEQ_LEN)
-
-        batch = await dataset.get_batch([0])
-
-        np.testing.assert_array_equal(batch[0], np.arange(SEQ_LEN, dtype=np.int32))
+        with pytest.raises(ValueError, match="not under output path"):
+            consolidate_shard_cache_ledgers(shard_paths, output_path, EXEMPLAR_FLAT)
 
 
 def test_sharded_cache_rejects_duplicate_shards():
@@ -145,6 +149,22 @@ def test_sharded_cache_requires_row_counts_for_finished_shards():
     )
 
     with pytest.raises(ValueError, match="missing row count"):
+        TreeCache("unused", EXEMPLAR_FLAT, ledger)
+
+
+@pytest.mark.parametrize("shard_name", ["/tmp/part-00000", "gs://bucket/cache/part-00000"])
+def test_sharded_cache_rejects_absolute_shard_paths(shard_name: str):
+    ledger = CacheLedger(
+        total_num_rows=1,
+        shard_rows={shard_name: 1},
+        is_finished=True,
+        finished_shards=[shard_name],
+        field_counts={"input_ids": ROW_WIDTH},
+        field_counts_by_shard={shard_name: {"input_ids": ROW_WIDTH}},
+        layout=CACHE_LAYOUT_SHARDED,
+    )
+
+    with pytest.raises(ValueError, match="must be relative"):
         TreeCache("unused", EXEMPLAR_FLAT, ledger)
 
 

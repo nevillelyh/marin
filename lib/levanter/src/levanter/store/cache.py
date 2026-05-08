@@ -125,8 +125,6 @@ class TreeCache(AsyncDataset[T_co]):
         return self.ledger.layout == CACHE_LAYOUT_SHARDED
 
     def _shard_path(self, shard_name: str) -> str:
-        if "://" in shard_name:
-            return shard_name
         return os.path.join(self.cache_dir, shard_name)
 
     async def async_len(self) -> int:
@@ -596,6 +594,9 @@ def _validate_sharded_ledger(ledger: CacheLedger) -> None:
         if shard_name in seen_shards:
             raise ValueError(f"Sharded cache ledger contains duplicate shard {shard_name}")
         seen_shards.add(shard_name)
+
+        if "://" in shard_name or os.path.isabs(shard_name):
+            raise ValueError(f"Sharded cache ledger shard path must be relative: {shard_name}")
 
         if shard_name not in ledger.shard_rows:
             raise ValueError(f"Sharded cache ledger missing row count for shard {shard_name}")
@@ -1082,8 +1083,8 @@ def consolidate_shard_cache_ledgers(
     """
     Consolidate multiple shard cache ledgers into one sharded cache ledger.
 
-    The output points at the original shard directories instead of copying their
-    arrays into a top-level TreeStore.
+    Shard directories must be under output_path. The output ledger stores their
+    relative paths instead of copying their arrays into a top-level TreeStore.
     """
     if metadata is None:
         metadata = CacheMetadata.empty()
@@ -1101,6 +1102,9 @@ def consolidate_shard_cache_ledgers(
         )
         ledger._serialize_and_commit(output_path)
         return ledger
+
+    for shard_path in shard_cache_paths:
+        _relative_shard_path(output_path, shard_path)
 
     logger.info(f"Consolidating {len(shard_cache_paths)} shard cache ledgers into {output_path}")
 
@@ -1342,17 +1346,23 @@ async def _consolidate_metadata(dest_path: str, exemplar: dict, shard_infos: lis
 
 
 def _relative_shard_path(output_path: str, shard_path: str) -> str:
-    if "://" in shard_path:
+    if "://" in output_path or "://" in shard_path:
         prefix = output_path.rstrip("/") + "/"
         if shard_path.startswith(prefix):
             return shard_path[len(prefix) :]
-        return shard_path
+        raise ValueError(f"Sharded cache path {shard_path} is not under output path {output_path}")
+
+    output_abs = os.path.abspath(output_path)
+    shard_abs = os.path.abspath(shard_path)
     try:
-        relative_path = os.path.relpath(shard_path, output_path)
-    except ValueError:
-        return shard_path
-    if relative_path == os.pardir or relative_path.startswith(os.pardir + os.sep):
-        return shard_path
+        common_path = os.path.commonpath([output_abs, shard_abs])
+    except ValueError as exc:
+        raise ValueError(f"Sharded cache path {shard_path} is not under output path {output_path}") from exc
+
+    if shard_abs == output_abs or common_path != output_abs:
+        raise ValueError(f"Sharded cache path {shard_path} is not under output path {output_path}")
+
+    relative_path = os.path.relpath(shard_abs, output_abs)
     return relative_path
 
 
