@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import concurrent.futures
 import copy
 import dataclasses
 import gc
@@ -105,6 +106,8 @@ class TreeCache(AsyncDataset[T_co]):
         self._shard_field_stores: Dict[Tuple[str, str], Any] = {}
         self._shard_field_offsets: Dict[str, np.ndarray] = {}
         self._flat_field_offsets: Dict[str, np.ndarray] = {}
+        self._flat_field_offset_futures: Dict[str, concurrent.futures.Future[np.ndarray]] = {}
+        self._flat_field_offsets_lock = threading.Lock()
 
         if not ledger.is_finished:
             raise RuntimeError(f"Cache at {cache_dir} is not finished.")
@@ -191,16 +194,40 @@ class TreeCache(AsyncDataset[T_co]):
         return self.ledger.finished_shards, offsets
 
     def _ensure_flat_field_offsets(self, field: str) -> np.ndarray:
-        offsets = self._flat_field_offsets.get(field)
-        if offsets is not None:
-            return offsets
         return blocking_wait(self._ensure_flat_field_offsets_async(field))
 
     async def _ensure_flat_field_offsets_async(self, field: str) -> np.ndarray:
-        offsets = self._flat_field_offsets.get(field)
-        if offsets is not None:
-            return offsets
+        with self._flat_field_offsets_lock:
+            offsets = self._flat_field_offsets.get(field)
+            if offsets is not None:
+                return offsets
 
+            future = self._flat_field_offset_futures.get(field)
+            if future is None:
+                future = concurrent.futures.Future()
+                self._flat_field_offset_futures[field] = future
+                should_build = True
+            else:
+                should_build = False
+
+        if not should_build:
+            return await asyncio.shield(asyncio.wrap_future(future))
+
+        try:
+            offsets = await self._build_flat_field_offsets_async(field)
+        except BaseException as exc:
+            with self._flat_field_offsets_lock:
+                self._flat_field_offset_futures.pop(field, None)
+            future.set_exception(exc)
+            raise
+
+        with self._flat_field_offsets_lock:
+            self._flat_field_offsets[field] = offsets
+            self._flat_field_offset_futures.pop(field, None)
+        future.set_result(offsets)
+        return offsets
+
+    async def _build_flat_field_offsets_async(self, field: str) -> np.ndarray:
         async def read_shard_offsets(shard_name: str, row_count: int):
             field_store = await self._shard_field_store_async(shard_name, field)
             return await field_store.offsets[1 : row_count + 1].read()

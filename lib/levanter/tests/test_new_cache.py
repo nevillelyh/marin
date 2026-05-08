@@ -199,6 +199,55 @@ def test_sharded_flat_field_offsets_read_shards_concurrently(monkeypatch):
     assert max_active_reads == len(shard_names)
 
 
+@pytest.mark.asyncio
+async def test_sharded_flat_field_offsets_share_in_flight_build(monkeypatch):
+    shard_names = ["shard_0", "shard_1", "shard_2"]
+    ledger = CacheLedger(
+        total_num_rows=3,
+        shard_rows={shard_name: 1 for shard_name in shard_names},
+        is_finished=True,
+        finished_shards=shard_names,
+        field_counts={"data": 9},
+        field_counts_by_shard={
+            "shard_0": {"data": 2},
+            "shard_1": {"data": 3},
+            "shard_2": {"data": 4},
+        },
+        layout=CACHE_LAYOUT_SHARDED,
+    )
+    cache = TreeCache("/unused", {"data": np.array([0], dtype=np.int64)}, ledger)
+    build_count = 0
+    build_started = asyncio.Event()
+    release_build = asyncio.Event()
+    expected_offsets = np.array([3, 2, 5, 9], dtype=np.int64)
+
+    async def build_offsets(field: str):
+        nonlocal build_count
+        assert field == "data"
+        build_count += 1
+        build_started.set()
+        await release_build.wait()
+        return expected_offsets
+
+    monkeypatch.setattr(cache, "_build_flat_field_offsets_async", build_offsets)
+
+    first = asyncio.create_task(cache._ensure_flat_field_offsets_async("data"))
+    await build_started.wait()
+    second = asyncio.create_task(cache._ensure_flat_field_offsets_async("data"))
+
+    await asyncio.sleep(0)
+    release_build.set()
+    first_offsets, second_offsets = await asyncio.gather(first, second)
+
+    np.testing.assert_array_equal(first_offsets, expected_offsets)
+    np.testing.assert_array_equal(second_offsets, expected_offsets)
+    assert build_count == 1
+
+    cached_offsets = await cache._ensure_flat_field_offsets_async("data")
+    np.testing.assert_array_equal(cached_offsets, expected_offsets)
+    assert build_count == 1
+
+
 def test_sharded_cache_rejects_drifted_aggregate_field_counts():
     ledger = CacheLedger(
         total_num_rows=2,
