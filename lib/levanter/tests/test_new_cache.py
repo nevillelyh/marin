@@ -199,6 +199,21 @@ def test_sharded_flat_field_offsets_read_shards_concurrently(monkeypatch):
     assert max_active_reads == len(shard_names)
 
 
+def test_sharded_cache_rejects_drifted_aggregate_field_counts():
+    ledger = CacheLedger(
+        total_num_rows=2,
+        shard_rows={"shard_0": 1, "shard_1": 1},
+        is_finished=True,
+        finished_shards=["shard_0", "shard_1"],
+        field_counts={"data": 4},
+        field_counts_by_shard={"shard_0": {"data": 2}, "shard_1": {"data": 3}},
+        layout=CACHE_LAYOUT_SHARDED,
+    )
+
+    with pytest.raises(ValueError, match="field count mismatch"):
+        TreeCache("/unused", {"data": np.array([0], dtype=np.int64)}, ledger)
+
+
 def test_full_end_to_end_cache():
     td = tempfile.TemporaryDirectory()
     with td as tmpdir:

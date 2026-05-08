@@ -615,6 +615,17 @@ def _validate_sharded_ledger(ledger: CacheLedger) -> None:
         if shard_name not in seen_shards:
             raise ValueError(f"Sharded cache ledger has field counts for unknown shard {shard_name}")
 
+    field_counts: Dict[str, int] = {}
+    for shard_name in ledger.finished_shards:
+        for field, count in ledger.field_counts_by_shard.get(shard_name, {}).items():
+            field_counts[field] = field_counts.get(field, 0) + count
+
+    if field_counts != ledger.field_counts:
+        raise ValueError(
+            "Sharded cache ledger field count mismatch: "
+            f"sum(finished shard field counts)={field_counts}, field_counts={ledger.field_counts}"
+        )
+
 
 def _tree_field(tree, field: str):
     value = tree
