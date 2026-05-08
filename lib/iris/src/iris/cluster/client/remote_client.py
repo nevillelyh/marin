@@ -21,6 +21,7 @@ from iris.cluster.log_store_helpers import build_log_source
 from iris.cluster.runtime.entrypoint import build_runtime_entrypoint
 from iris.cluster.types import Entrypoint, EnvironmentSpec, JobName, TaskAttempt, adjust_tpu_replicas, is_job_finished
 from iris.rpc import controller_pb2, job_pb2
+from iris.rpc.compression import IRIS_RPC_COMPRESSIONS
 from iris.rpc.controller_connect import ControllerServiceClientSync
 from iris.rpc.errors import call_with_retry, format_connect_error, poll_with_retries
 from iris.time_proto import duration_to_proto
@@ -35,14 +36,12 @@ CONTROLLER_UNAVAILABLE_TOLERANCE = 3600.0
 
 # Upper bound on GetJobState polling cadence for long-running jobs. The loop
 # ramps 100ms -> 1s within a handful of polls (factor=1.5 in ExponentialBackoff)
-# and then caps here, so long jobs cost ~1 state RPC / 30s instead of hammering
-# the controller at the old ~2s ceiling.
+# and then caps here, so long jobs cost ~1 state RPC / 30s.
 MAX_STATE_POLL_INTERVAL = 30.0
 
 # Floor on the backoff cap. ``ExponentialBackoff`` requires ``maximum >= initial``
-# (currently 100ms), so we clamp the caller-supplied ``poll_interval`` up to this
-# value before handing it to the backoff. Callers asking for a sub-100ms cap end
-# up polling at 100ms instead of crashing with ValueError.
+# (currently 100ms), so callers asking for a sub-100ms cap are clamped to this
+# value before being handed to the backoff.
 MIN_STATE_POLL_INTERVAL = 0.1
 
 
@@ -78,6 +77,8 @@ class RemoteClusterClient:
             address=controller_address,
             timeout_ms=timeout_ms,
             interceptors=interceptors,
+            accept_compression=IRIS_RPC_COMPRESSIONS,
+            send_compression=None,
         )
         self._log_client = LogClient.connect(
             controller_address,

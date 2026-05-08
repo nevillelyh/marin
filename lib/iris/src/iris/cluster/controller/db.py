@@ -11,7 +11,6 @@ import sqlite3
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from dataclasses import replace as dc_replace
 from pathlib import Path
 from threading import Lock, RLock
 from typing import Any
@@ -20,6 +19,7 @@ from rigging.timing import Deadline, Duration, Timestamp
 
 from iris.cluster.constraints import AttributeValue
 from iris.cluster.controller.schema import decode_timestamp_ms, decode_worker_id
+from iris.cluster.controller.worker_health import WorkerHealthTracker
 from iris.cluster.types import TERMINAL_TASK_STATES, JobName, WorkerId
 from iris.rpc import job_pb2
 
@@ -827,10 +827,7 @@ class ControllerDB:
 
 
 def running_tasks_by_worker(db: ControllerDB, worker_ids: set[WorkerId]) -> dict[WorkerId, set[JobName]]:
-    """Return the set of currently-running task IDs for each worker.
-
-    Uses the denormalized current_worker_id column instead of joining task_attempts.
-    """
+    """Return the set of currently-running task IDs for each worker."""
     if not worker_ids:
         return {}
     placeholders = ",".join("?" for _ in worker_ids)
@@ -919,32 +916,72 @@ def _worker_row_select() -> str:
     return WORKER_ROW_PROJECTION.select_clause()
 
 
-def healthy_active_workers_with_attributes(db: ControllerDB) -> list:
-    """Fetch all healthy, active workers with their attributes populated.
+@dataclass(frozen=True, slots=True)
+class SchedulableWorker:
+    """Worker shape consumed by the scheduler.
 
-    Returns WorkerRow (scalar-only) so the scheduling loop avoids loading metadata columns.
-    Uses the in-memory attribute cache to avoid a per-cycle SQL join.
+    Field names mirror the :class:`scheduler.WorkerSnapshot` protocol so
+    instances flow into ``Scheduler.create_scheduling_context`` without
+    an adapter.
     """
+
+    worker_id: WorkerId
+    address: str
+    total_cpu_millicores: int
+    total_memory_bytes: int
+    total_gpu_count: int
+    total_tpu_count: int
+    device_type: str
+    device_variant: str
+    attributes: dict[str, AttributeValue]
+    committed_cpu_millicores: int
+    committed_mem: int
+    committed_gpu: int
+    committed_tpu: int
+
+
+def healthy_active_workers_with_attributes(
+    db: ControllerDB,
+    health: WorkerHealthTracker,
+) -> list[SchedulableWorker]:
+    """Return healthy + active workers with attributes and committed totals."""
     from iris.cluster.controller.schema import WORKER_ROW_PROJECTION
 
+    liveness = health.all()
+    healthy_active = {wid for wid, l in liveness.items() if l.healthy and l.active}
+    if not healthy_active:
+        return []
+    placeholders = ",".join("?" for _ in healthy_active)
     with db.read_snapshot() as q:
-        workers = WORKER_ROW_PROJECTION.decode(
-            q.fetchall(f"SELECT {_worker_row_select()} FROM workers w WHERE w.healthy = 1 AND w.active = 1"),
+        rows = WORKER_ROW_PROJECTION.decode(
+            q.fetchall(
+                f"SELECT {_worker_row_select()} FROM workers w WHERE w.worker_id IN ({placeholders})",
+                tuple(str(wid) for wid in healthy_active),
+            ),
         )
-        if not workers:
+        if not rows:
             return []
     attrs_by_worker = db.get_worker_attributes()
-    return [
-        dc_replace(
-            w,
-            attributes=attrs_by_worker.get(w.worker_id, {}),
-            available_cpu_millicores=w.total_cpu_millicores - w.committed_cpu_millicores,
-            available_memory=w.total_memory_bytes - w.committed_mem,
-            available_gpus=w.total_gpu_count - w.committed_gpu,
-            available_tpus=w.total_tpu_count - w.committed_tpu,
+    out: list[SchedulableWorker] = []
+    for w in rows:
+        out.append(
+            SchedulableWorker(
+                worker_id=w.worker_id,
+                address=w.address,
+                total_cpu_millicores=w.total_cpu_millicores,
+                total_memory_bytes=w.total_memory_bytes,
+                total_gpu_count=w.total_gpu_count,
+                total_tpu_count=w.total_tpu_count,
+                device_type=w.device_type,
+                device_variant=w.device_variant,
+                attributes=attrs_by_worker.get(w.worker_id, {}),
+                committed_cpu_millicores=w.committed_cpu_millicores,
+                committed_mem=w.committed_mem,
+                committed_gpu=w.committed_gpu,
+                committed_tpu=w.committed_tpu,
+            )
         )
-        for w in workers
-    ]
+    return out
 
 
 def insert_task_profile(

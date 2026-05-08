@@ -6,6 +6,7 @@
 import shutil
 import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from dataclasses import replace as _replace
 from pathlib import Path
 from unittest.mock import MagicMock, Mock
@@ -33,10 +34,12 @@ from iris.cluster.controller.controller import Controller, ControllerConfig
 from iris.cluster.controller.db import (
     ACTIVE_TASK_STATES,
     ControllerDB,
+    SchedulableWorker,
     _decode_attribute_rows,
     task_row_can_be_scheduled,
     task_row_is_finished,
 )
+from iris.cluster.controller.db import healthy_active_workers_with_attributes as _healthy_active_workers_with_attributes
 from iris.cluster.controller.provider import ProviderUnsupportedError
 from iris.cluster.controller.schema import (
     ATTEMPT_PROJECTION,
@@ -340,11 +343,59 @@ def query_job_row(state: ControllerTransitions, job_id: JobName):
         )
 
 
-def query_worker(state: ControllerTransitions, worker_id: WorkerId) -> WorkerRow | None:
+@dataclass(frozen=True, slots=True)
+class WorkerView:
+    """Combined snapshot for tests that read DB row data + liveness in one call."""
+
+    worker_id: WorkerId
+    address: str
+    total_cpu_millicores: int
+    total_memory_bytes: int
+    total_gpu_count: int
+    total_tpu_count: int
+    device_type: str
+    device_variant: str
+    attributes: dict
+    healthy: bool
+    active: bool
+    consecutive_failures: int
+    last_heartbeat_ms: int
+    committed_cpu_millicores: int
+    committed_mem: int
+    committed_gpu: int
+    committed_tpu: int
+
+
+def _worker_view(row: WorkerRow, liveness) -> WorkerView:
+    return WorkerView(
+        worker_id=row.worker_id,
+        address=row.address,
+        total_cpu_millicores=row.total_cpu_millicores,
+        total_memory_bytes=row.total_memory_bytes,
+        total_gpu_count=row.total_gpu_count,
+        total_tpu_count=row.total_tpu_count,
+        device_type=row.device_type,
+        device_variant=row.device_variant,
+        attributes=row.attributes,
+        healthy=liveness.healthy,
+        active=liveness.active,
+        consecutive_failures=liveness.consecutive_failures,
+        last_heartbeat_ms=liveness.last_heartbeat_ms,
+        committed_cpu_millicores=row.committed_cpu_millicores,
+        committed_mem=row.committed_mem,
+        committed_gpu=row.committed_gpu,
+        committed_tpu=row.committed_tpu,
+    )
+
+
+def query_worker(state: ControllerTransitions, worker_id: WorkerId) -> WorkerView | None:
     with state._db.read_snapshot() as q:
-        return WORKER_ROW_PROJECTION.decode_one(
+        decoded = WORKER_ROW_PROJECTION.decode_one(
             q.fetchall("SELECT * FROM workers WHERE worker_id = ? LIMIT 1", (str(worker_id),)),
         )
+    if decoded is None:
+        return None
+    return _worker_view(decoded, state._store.health.liveness(decoded.worker_id))
 
 
 def query_tasks_for_job(state: ControllerTransitions, job_id: JobName) -> list[TaskDetailRow]:
@@ -404,8 +455,8 @@ def register_worker(
             slice_id=slice_id,
             scale_group=scale_group,
         )
-        if not healthy:
-            state._store.workers.set_health_for_test(cur, wid, healthy=False)
+    if not healthy:
+        state._store.workers.set_health_for_test(wid, healthy=False)
     return wid
 
 
@@ -583,23 +634,11 @@ def hydrate_worker_attributes(state: ControllerTransitions, workers: list) -> li
             tuple(worker_ids),
         )
     attrs_by_worker = _decode_attribute_rows(attrs)
-    return [
-        _replace(
-            w,
-            attributes=attrs_by_worker.get(w.worker_id, {}),
-            available_cpu_millicores=w.total_cpu_millicores - w.committed_cpu_millicores,
-            available_memory=w.total_memory_bytes - w.committed_mem,
-            available_gpus=w.total_gpu_count - w.committed_gpu,
-            available_tpus=w.total_tpu_count - w.committed_tpu,
-        )
-        for w in workers
-    ]
+    return [_replace(w, attributes=attrs_by_worker.get(w.worker_id, {})) for w in workers]
 
 
-def healthy_active_workers(state: ControllerTransitions) -> list[WorkerRow]:
-    with state._db.read_snapshot() as q:
-        workers = WORKER_ROW_PROJECTION.decode(q.fetchall("SELECT * FROM workers WHERE healthy = 1 AND active = 1"))
-    return hydrate_worker_attributes(state, workers)
+def healthy_active_workers(state: ControllerTransitions) -> list[SchedulableWorker]:
+    return _healthy_active_workers_with_attributes(state._db, state._store.health)
 
 
 def dispatch_task(state: ControllerTransitions, task: TaskDetailRow, worker_id: WorkerId) -> None:

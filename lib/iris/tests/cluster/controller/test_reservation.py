@@ -35,9 +35,8 @@ from iris.cluster.controller.controller import (
     _worker_matches_reservation_entry,
     job_requirements_from_job,
 )
-from iris.cluster.controller.db import task_row_can_be_scheduled
+from iris.cluster.controller.db import SchedulableWorker, task_row_can_be_scheduled
 from iris.cluster.controller.scheduler import JobRequirements, Scheduler, SchedulingContext
-from iris.cluster.controller.schema import WorkerRow
 from iris.cluster.controller.transitions import (
     RESERVATION_HOLDER_JOB_NAME,
     Assignment,
@@ -134,8 +133,7 @@ def _make_worker(
     worker_id: str,
     metadata: job_pb2.WorkerMetadata | None = None,
     attributes: dict[str, AttributeValue] | None = None,
-    healthy: bool = True,
-) -> WorkerRow:
+) -> SchedulableWorker:
     meta = metadata or _cpu_metadata()
     # Workers always have device attributes from config (Stage 3).
     # Merge explicit attributes on top of the device-derived defaults.
@@ -148,17 +146,9 @@ def _make_worker(
     total_mem = meta.memory_bytes
     total_gpu = meta.gpu_count
     total_tpu = 1 if meta.tpu_name else 0
-    return WorkerRow(
+    return SchedulableWorker(
         worker_id=WorkerId(worker_id),
         address=f"{worker_id}:8080",
-        healthy=healthy,
-        active=True,
-        consecutive_failures=0,
-        last_heartbeat=Timestamp.now(),
-        committed_cpu_millicores=0,
-        committed_mem=0,
-        committed_gpu=0,
-        committed_tpu=0,
         total_cpu_millicores=total_cpu,
         total_memory_bytes=total_mem,
         total_gpu_count=total_gpu,
@@ -166,10 +156,10 @@ def _make_worker(
         device_type=dt,
         device_variant=dv,
         attributes=default_attrs,
-        available_cpu_millicores=total_cpu,
-        available_memory=total_mem,
-        available_gpus=total_gpu,
-        available_tpus=total_tpu,
+        committed_cpu_millicores=0,
+        committed_mem=0,
+        committed_gpu=0,
+        committed_tpu=0,
     )
 
 
@@ -746,7 +736,7 @@ def test_taint_constraint_preserves_existing_constraints():
 
 
 def _build_context_with_workers(
-    workers: list[WorkerRow],
+    workers: list[SchedulableWorker],
     pending_tasks: list[JobName],
     jobs: dict[JobName, JobRequirements],
 ) -> SchedulingContext:
@@ -925,6 +915,7 @@ def test_region_constraint_injected_from_claimed_workers(ctrl):
         jid.to_wire(),
         ctrl.reservation_claims,
         ctrl._db,
+        ctrl.state._store.health,
         [],
     )
 
@@ -948,6 +939,7 @@ def test_region_constraint_not_injected_when_already_present(ctrl):
         jid.to_wire(),
         ctrl.reservation_claims,
         ctrl._db,
+        ctrl.state._store.health,
         [existing],
     )
 
@@ -967,6 +959,7 @@ def test_region_constraint_not_injected_when_no_region_attr(ctrl):
         jid.to_wire(),
         ctrl.reservation_claims,
         ctrl._db,
+        ctrl.state._store.health,
         [],
     )
 
@@ -990,6 +983,7 @@ def test_region_constraint_multiple_regions(ctrl):
         jid.to_wire(),
         ctrl.reservation_claims,
         ctrl._db,
+        ctrl.state._store.health,
         [],
     )
 
@@ -1013,6 +1007,7 @@ def test_no_injection_for_non_reservation_job(ctrl):
         "/test-user/unrelated-job",
         ctrl.reservation_claims,
         ctrl._db,
+        ctrl.state._store.health,
         [],
     )
 

@@ -44,6 +44,7 @@ from iris.cluster.controller.schema import (
 )
 from iris.cluster.controller.stores import (
     ActiveTaskRow,
+    AddEndpointOutcome,
     ControllerStore,
     EndpointStore,
     JobConfigInsertParams,
@@ -1165,7 +1166,6 @@ class ControllerTransitions:
             WorkerUpsertParams(
                 worker_id=worker_id,
                 address=address,
-                last_heartbeat_ms=now_ms,
                 total_cpu_millicores=metadata.cpu_count * 1000,
                 total_memory_bytes=metadata.memory_bytes,
                 total_gpu_count=gpu_count,
@@ -1191,6 +1191,7 @@ class ControllerTransitions:
                 md_git_hash=metadata.git_hash,
                 md_device_json=proto_to_json(metadata.device),
             ),
+            now_ms=now_ms,
         )
         self._store.workers.replace_attributes(cur, worker_id, attrs)
         # Update in-memory attribute cache only after commit so a rolled-back tx
@@ -1319,19 +1320,14 @@ class ControllerTransitions:
         )
 
     def _update_worker_health(self, cur: TransactionCursor, req: HeartbeatApplyRequest, now_ms: int) -> bool:
-        """Update worker health, resource snapshot, and history.
+        """Update worker health in the in-memory tracker.
 
         Returns False if the worker doesn't exist (caller should bail).
         """
         existing = self._store.workers.filter_existing(cur, [req.worker_id])
         if str(req.worker_id) not in existing:
             return False
-        self._store.workers.apply_snapshots(
-            cur,
-            [req.worker_id],
-            now_ms,
-            reset_health=True,
-        )
+        self._store.workers.heartbeat([req.worker_id], now_ms, reset_health=True)
         return True
 
     def _apply_task_transitions(
@@ -1554,7 +1550,7 @@ class ControllerTransitions:
             if task_state != prior_state:
                 jobs_to_recompute.add(task.job_id)
 
-        # Recompute job states once per job instead of once per task.
+        # Recompute job states once per job (deduplicated above).
         for job_id in jobs_to_recompute:
             if job_id in cascaded_jobs:
                 continue
@@ -1601,8 +1597,7 @@ class ControllerTransitions:
 
         # ── Batch worker health updates ───────────────────────────────
         existing_workers = self._store.workers.filter_existing(cur, [req.worker_id for req in requests])
-        self._store.workers.apply_snapshots(
-            cur,
+        self._store.workers.heartbeat(
             [req.worker_id for req in requests if str(req.worker_id) in existing_workers],
             now_ms,
             reset_health=True,
@@ -1774,13 +1769,14 @@ class ControllerTransitions:
         now_ms: int | None = None,
     ) -> WorkerFailureResult:
         """Remove a failed worker inside an existing transaction."""
-        status = self._store.workers.get_active_status(cur, worker_id)
-        if status is None:
+        liveness = self._store.workers.liveness(worker_id)
+        if not liveness.active:
             return WorkerFailureResult(worker_removed=True)
 
         now_ms = now_ms or Timestamp.now().epoch_ms()
-        last_contact_age_ms = None if status.last_heartbeat_ms is None else max(0, now_ms - status.last_heartbeat_ms)
-        self._store.workers.mark_unhealthy(cur, worker_id)
+        last_hb = liveness.last_heartbeat_ms
+        last_contact_age_ms = None if not last_hb else max(0, now_ms - last_hb)
+        self._store.workers.mark_unhealthy(worker_id)
         removal = self._remove_failed_worker(cur, worker_id, error, now_ms=now_ms)
         return WorkerFailureResult(
             tasks_to_kill=removal.tasks_to_kill,
@@ -1800,7 +1796,7 @@ class ControllerTransitions:
         Each ``(worker_id, worker_address, reason)`` tuple triggers a
         worker-removal transaction. Chunks commit between themselves so the
         SQLite writer is released and other RPCs (register, apply_heartbeats_batch,
-        ...) can interleave instead of stalling behind a zone-wide failure.
+        ...) can interleave during a zone-wide failure.
         """
         if not failures:
             return WorkerFailureBatchResult()
@@ -2163,11 +2159,10 @@ class ControllerTransitions:
             jobs_deleted += 1
             time.sleep(pause_between_s)
 
-        # 2. Workers: one at a time (CASCADE to attributes)
+        # 2. Workers: one at a time (CASCADE to attributes).
         workers_deleted = 0
         while not _stopped():
-            with self._store.read_snapshot() as snap:
-                worker_id = self._store.workers.find_prunable(snap, worker_cutoff_ms)
+            worker_id = self._store.workers.find_prunable(worker_cutoff_ms)
             if worker_id is None:
                 break
             with self._store.transaction() as cur:
@@ -2208,25 +2203,19 @@ class ControllerTransitions:
     # Split Heartbeat Helpers
     # =========================================================================
 
-    def update_worker_pings(
-        self,
-        cur: TransactionCursor,
-        worker_ids: Iterable[WorkerId],
-    ) -> None:
-        """Apply a batch of Ping RPC results within the caller's transaction.
+    def update_worker_pings(self, worker_ids: Iterable[WorkerId]) -> None:
+        """Apply a batch of Ping RPC results into the in-memory health tracker.
 
-        Bumps ``last_heartbeat_ms`` for each successfully-pinged worker.
-        Per-tick host utilization is no longer persisted in the controller DB —
-        workers emit it directly to the ``iris.worker`` stats namespace.
-        Does not touch healthy/active/consecutive_failures — the ping loop
-        tracks failures in-memory and uses ``fail_workers_batch`` to remove
-        workers past threshold.
+        Bumps ``last_heartbeat_ms`` for each successfully-pinged worker. Does
+        not touch healthy/active/consecutive_failures — the ping loop tracks
+        failures via :meth:`WorkerHealthTracker.ping` and reaps workers via
+        :meth:`fail_workers_batch`.
         """
         ids = list(worker_ids)
         if not ids:
             return
         now_ms = Timestamp.now().epoch_ms()
-        self._store.workers.apply_snapshots(cur, ids, now_ms, reset_health=False)
+        self._store.workers.heartbeat(ids, now_ms, reset_health=False)
 
     def get_running_tasks_for_poll(
         self,
@@ -2317,13 +2306,19 @@ class ControllerTransitions:
 
     # --- Endpoint Management ---
 
-    def add_endpoint(self, cur: TransactionCursor, endpoint: EndpointRow) -> bool:
+    def add_endpoint(
+        self,
+        cur: TransactionCursor,
+        endpoint: EndpointRow,
+        *,
+        expected_attempt_id: int | None = None,
+    ) -> AddEndpointOutcome:
         """Add an endpoint row through the store's endpoint cache.
 
-        Returns True if the endpoint was inserted, False if the task is already
-        terminal (to prevent orphaned endpoints that would never be cleaned up).
+        Validation (existence, terminal-state, stale-attempt) runs inside the
+        write transaction so the RPC handler can drop its precheck reads.
         """
-        return self._store.endpoints.add(cur, endpoint)
+        return self._store.endpoints.add(cur, endpoint, expected_attempt_id=expected_attempt_id)
 
     def remove_endpoint(self, cur: TransactionCursor, endpoint_id: str) -> EndpointRow | None:
         return self._store.endpoints.remove(cur, endpoint_id)
@@ -2333,9 +2328,8 @@ class ControllerTransitions:
     # ---------------------------------------------------------------------
 
     def set_worker_health_for_test(self, worker_id: WorkerId, healthy: bool) -> None:
-        """Test helper: set worker health in DB."""
-        with self._store.transaction() as cur:
-            self._store.workers.set_health_for_test(cur, worker_id, healthy)
+        """Test helper: set worker health in the in-memory tracker."""
+        self._store.workers.set_health_for_test(worker_id, healthy)
 
     def set_worker_attribute_for_test(self, worker_id: WorkerId, key: str, value: AttributeValue) -> None:
         """Test helper: upsert one worker attribute in DB."""
@@ -2642,9 +2636,8 @@ class ControllerTransitions:
     # =========================================================================
 
     def set_worker_consecutive_failures_for_test(self, worker_id: WorkerId, consecutive_failures: int) -> None:
-        """Test helper: set worker consecutive failure count in DB."""
-        with self._store.transaction() as cur:
-            self._store.workers.set_consecutive_failures_for_test(cur, worker_id, consecutive_failures)
+        """Test helper: set worker consecutive failure count in the in-memory tracker."""
+        self._store.workers.set_consecutive_failures_for_test(worker_id, consecutive_failures)
 
     def set_task_state_for_test(
         self,
