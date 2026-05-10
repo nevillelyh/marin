@@ -437,16 +437,18 @@ def _jobs_with_reservations(queries: ControllerDB, states: tuple[int, ...]) -> l
 def _get_running_tasks_with_band_and_value(
     db: ControllerDB,
     claimed_workers: set[WorkerId],
-    user_spend: dict[str, int] | None = None,
-    user_budget_limits: dict[str, int] | None = None,
-    user_budget_defaults: UserBudgetDefaults | None = None,
 ) -> list[RunningTaskInfo]:
     """Query running tasks with band, worker, resource spec, and coscheduling status.
 
     Skips tasks on reservation-claimed workers since those workers are spoken for.
-    When ``user_spend`` and ``user_budget_limits`` are provided, the effective band
-    is computed so over-budget users' tasks are treated as BATCH for preemption.
-    Users without a budget row fall back to ``user_budget_defaults``.
+
+    The reported band is the value persisted in ``tasks.priority_band``, which
+    is stamped at assignment time (see ``_commit_assignments`` and
+    ``TaskStore.mark_assigned``). The over-budget downgrade is applied at that
+    stamping point, not on every scheduling tick, which prevents a running
+    task from oscillating into BATCH and back as its own user crosses the
+    budget cliff — the source of mutual same-band preemption between two
+    users sitting at their limits.
     """
     with db.read_snapshot() as q:
         rows = q.raw(
@@ -463,9 +465,6 @@ def _get_running_tasks_with_band_and_value(
                 "worker_id": WorkerId,
             },
         )
-    _spend = user_spend or {}
-    _limits = user_budget_limits or {}
-    _defaults = user_budget_defaults or UserBudgetDefaults()
     result: list[RunningTaskInfo] = []
     for row in rows:
         wid = row.worker_id
@@ -477,12 +476,11 @@ def _get_running_tasks_with_band_and_value(
             row.res_disk_bytes,
             row.res_device_json,
         )
-        band = compute_effective_band(row.priority_band, row.task_id.user, _spend, _limits, _defaults)
         result.append(
             RunningTaskInfo(
                 task_id=row.task_id,
                 worker_id=wid,
-                band_sort_key=band,
+                band_sort_key=row.priority_band,
                 resource_value=resource_value(
                     resources.cpu_millicores,
                     resources.memory_bytes,
@@ -670,12 +668,30 @@ def _schedulable_tasks(queries: ControllerDB) -> list[TaskRow]:
         tasks = TASK_ROW_PROJECTION.decode(
             snapshot.fetchall(
                 f"SELECT {TASK_ROW_PROJECTION.select_clause()} FROM tasks t WHERE t.state = ? "
-                "ORDER BY t.priority_band ASC, t.priority_neg_depth ASC, t.priority_root_submitted_ms ASC, "
+                "ORDER BY t.priority_neg_depth ASC, t.priority_root_submitted_ms ASC, "
                 "t.submitted_at_ms ASC, t.priority_insertion ASC",
                 (job_pb2.TASK_STATE_PENDING,),
             ),
         )
     return [task for task in tasks if task_row_can_be_scheduled(task)]
+
+
+def _sort_pending_tasks_by_resolved_band(store: ControllerStore, pending_tasks: list[TaskRow]) -> list[TaskRow]:
+    """Order pending rows using immutable job_config priority bands."""
+    if not pending_tasks:
+        return []
+    with store.read_snapshot() as snap:
+        requested_bands = store.jobs.get_priority_bands(snap, {task.job_id for task in pending_tasks})
+    return sorted(
+        pending_tasks,
+        key=lambda task: (
+            requested_bands.get(task.job_id, job_pb2.PRIORITY_BAND_INTERACTIVE),
+            task.priority_neg_depth,
+            task.priority_root_submitted_ms,
+            task.submitted_at.epoch_ms(),
+            task.priority_insertion,
+        ),
+    )
 
 
 def _tasks_by_ids_with_attempts(queries: ControllerDB, task_ids: set[JobName]) -> dict[JobName, TaskDetailRow]:
@@ -1904,7 +1920,7 @@ class Controller:
         """
         timer = Timer()
         with slow_log(logger, "scheduling state reads", threshold_ms=50):
-            pending_tasks = _schedulable_tasks(self._db)
+            pending_tasks = _sort_pending_tasks_by_resolved_band(self._store, _schedulable_tasks(self._db))
             workers = healthy_active_workers_with_attributes(self._db, self._health)
             with self._db.read_snapshot() as snap:
                 usage_by_worker = self._store.attempts.resource_usage_by_worker(snap)
@@ -1989,11 +2005,24 @@ class Controller:
         """
         with self._db.read_snapshot() as budget_snapshot:
             user_spend = compute_user_spend(budget_snapshot)
+            # Source the requested band from ``job_config`` (immutable since
+            # submission), not from ``tasks.priority_band`` (which is overwritten
+            # with the effective band at assign time). Otherwise a task that was
+            # downgraded to BATCH while its user was over budget would stay
+            # BATCH forever after preemption — ``compute_effective_band`` only
+            # demotes, never promotes back to the user's requested band.
+            requested_bands = self._store.jobs.get_priority_bands(
+                budget_snapshot, {task.job_id for task in pending_tasks}
+            )
         user_budget_limits = self._db.get_all_user_budget_limits()
         defaults = self._config.user_budget_defaults
         task_band_map: dict[JobName, int] = {
             task.task_id: compute_effective_band(
-                task.priority_band, task.task_id.user, user_spend, user_budget_limits, defaults
+                requested_bands.get(task.job_id, task.priority_band),
+                task.task_id.user,
+                user_spend,
+                user_budget_limits,
+                defaults,
             )
             for task in pending_tasks
         }
@@ -2070,7 +2099,7 @@ class Controller:
                 len(result.assignments),
             )
         if all_assignments:
-            self._commit_assignments(all_assignments)
+            self._commit_assignments(all_assignments, order.task_band_map)
             logger.debug(
                 "Scheduling cycle: %d assignments (%d preferred, %d normal), %dms (state read: %dms)",
                 len(all_assignments),
@@ -2081,8 +2110,18 @@ class Controller:
             )
         return all_assignments, context, modified_jobs
 
-    def _commit_assignments(self, assignments: list[tuple[JobName, WorkerId]]) -> None:
+    def _commit_assignments(
+        self,
+        assignments: list[tuple[JobName, WorkerId]],
+        task_band_map: dict[JobName, int],
+    ) -> None:
         """Persist scheduler decisions to ``tasks.state = ASSIGNED`` rows.
+
+        Each assignment carries the effective priority band from
+        ``task_band_map`` (computed against the snapshot's user spend) so
+        ``mark_assigned`` can stamp it onto ``tasks.priority_band``. The
+        preemption pass then trusts that stamped value instead of
+        recomputing from current spend on every tick.
 
         The polling reconcile thread reads ASSIGNED rows on its next tick
         (woken via ``_polling_wake``) and fans out the StartTasks RPCs.
@@ -2091,7 +2130,14 @@ class Controller:
             for task_id, worker_id in assignments:
                 logger.info("[DRY-RUN] Would assign task %s to worker %s", task_id, worker_id)
             return
-        command = [Assignment(task_id=task_id, worker_id=worker_id) for task_id, worker_id in assignments]
+        command = [
+            Assignment(
+                task_id=task_id,
+                worker_id=worker_id,
+                priority_band=task_band_map.get(task_id),
+            )
+            for task_id, worker_id in assignments
+        ]
         with self._store.transaction() as cur:
             self._transitions.queue_assignments(cur, command)
         # Wake the polling thread; every tick reconciles every healthy worker,
@@ -2120,13 +2166,7 @@ class Controller:
         preemptions: list[tuple[JobName, JobName]] = []
         if unscheduled:
             claimed_workers = set(claims.keys())
-            running_info = _get_running_tasks_with_band_and_value(
-                self._db,
-                claimed_workers,
-                user_spend=order.user_spend,
-                user_budget_limits=order.user_budget_limits,
-                user_budget_defaults=self._config.user_budget_defaults,
-            )
+            running_info = _get_running_tasks_with_band_and_value(self._db, claimed_workers)
             preemptions = _run_preemption_pass(unscheduled, running_info, context)
             # Apply all preemptions in one transaction so slice evictions
             # (N siblings of a coscheduled preemptor) are all-or-nothing.

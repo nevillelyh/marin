@@ -2473,6 +2473,7 @@ class ControllerServiceImpl:
                     (job_pb2.TASK_STATE_PENDING,),
                 ),
             )
+            pending_requested_bands = self._store.jobs.get_priority_bands(snap, {row.job_id for row in pending_rows})
 
             # Running tasks: only task_id, priority_band, and worker — no
             # job_config join is needed for the rolled-up counts below.
@@ -2492,7 +2493,11 @@ class ControllerServiceImpl:
                 continue
             user_id = row.task_id.user
             eff_band = compute_effective_band(
-                row.priority_band, user_id, user_spend, budget_limits, self._user_budget_defaults
+                pending_requested_bands.get(row.job_id, row.priority_band),
+                user_id,
+                user_spend,
+                budget_limits,
+                self._user_budget_defaults,
             )
             job_id = (row.task_id.parent or row.task_id).to_wire()
             key = (eff_band, user_id, job_id)
@@ -2500,15 +2505,15 @@ class ControllerServiceImpl:
             total_pending += 1
 
         # Aggregate running into (band, user, worker, job) → count buckets.
+        # Use the stamped ``tasks.priority_band`` directly: the scheduler stamps the
+        # effective band at assign time (see ``_commit_assignments``), so re-running
+        # ``compute_effective_band`` here against current spend would double-demote.
         running_counts: dict[tuple[int, str, str, str], int] = {}
         total_running = 0
         for row in running_rows:
             user_id = row.task_id.user
-            eff_band = compute_effective_band(
-                row.priority_band, user_id, user_spend, budget_limits, self._user_budget_defaults
-            )
             job_id = (row.task_id.parent or row.task_id).to_wire()
-            key = (eff_band, user_id, str(row.worker_id), job_id)
+            key = (row.priority_band, user_id, str(row.worker_id), job_id)
             running_counts[key] = running_counts.get(key, 0) + 1
             total_running += 1
 
